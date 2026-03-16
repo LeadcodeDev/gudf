@@ -1,0 +1,13 @@
+[package]
+name = "gudf-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gudf"
+path = "src/main.rs"
+
+[dependencies]
+gudf = { path = "../gudf" }
+clap = { version = "4", features = ["derive"] }
+colored = "2"

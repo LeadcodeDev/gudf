@@ -1,0 +1,50 @@
+[package]
+name = "gudf"
+version = "0.1.0"
+edition = "2021"
+description = "Git Unified Diff Format — universal diff library for text, JSON, TOML, YAML, and code"
+license = "MIT"
+
+[dependencies]
+similar = "2"
+serde_json = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# Tree-sitter core
+tree-sitter = "0.24"
+
+# Tree-sitter grammars (all compatible with tree-sitter 0.24 via LanguageFn)
+tree-sitter-bash = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-dart = "0.1"
+tree-sitter-elixir = "0.3"
+tree-sitter-erlang = "0.15"
+tree-sitter-go = "0.23"
+tree-sitter-haskell = "0.23"
+tree-sitter-hcl = "1"
+tree-sitter-html = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-lua = "0.5"
+tree-sitter-ocaml = "0.24"
+tree-sitter-php = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-r = "1"
+tree-sitter-regex = "0.24"
+tree-sitter-ruby = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-scala = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-typescript = "0.23"
+tree-sitter-yaml = "0.7"
+tree-sitter-zig = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
