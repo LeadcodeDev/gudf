@@ -31,7 +31,7 @@ impl Format for TomlFormat {
     }
 }
 
-fn toml_to_json(value: toml::Value) -> serde_json::Value {
+pub(crate) fn toml_to_json(value: toml::Value) -> serde_json::Value {
     match value {
         toml::Value::String(s) => serde_json::Value::String(s),
         toml::Value::Integer(i) => serde_json::json!(i),

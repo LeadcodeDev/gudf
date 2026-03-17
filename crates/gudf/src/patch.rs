@@ -54,7 +54,7 @@ fn patch_text(original: &str, changes: &[Change]) -> Result<String, GudfError> {
                     offset -= 1;
                 }
             }
-            ChangeKind::Modified => {
+            ChangeKind::Modified | ChangeKind::Moved | ChangeKind::Renamed => {
                 let value = change
                     .new_value
                     .as_deref()
@@ -81,7 +81,7 @@ fn patch_json(original: &str, changes: &[Change]) -> Result<String, GudfError> {
         serde_json::from_str(original).map_err(|e| GudfError::ParseError(e.to_string()))?;
 
     for change in changes {
-        if change.kind == ChangeKind::Unchanged {
+        if matches!(change.kind, ChangeKind::Unchanged) {
             continue;
         }
         let path = match &change.path {
@@ -90,7 +90,7 @@ fn patch_json(original: &str, changes: &[Change]) -> Result<String, GudfError> {
         };
 
         match change.kind {
-            ChangeKind::Added | ChangeKind::Modified => {
+            ChangeKind::Added | ChangeKind::Modified | ChangeKind::Moved | ChangeKind::Renamed => {
                 let new_val: serde_json::Value = change
                     .new_value
                     .as_deref()
@@ -278,6 +278,7 @@ mod tests {
                 line: 2,
                 column: None,
             }),
+            annotations: Vec::new(),
         }];
         let result = patch_text(original, &changes).unwrap();
         assert!(result.contains("new_line"));
@@ -292,6 +293,7 @@ mod tests {
             old_value: Some("\"Alice\"".to_string()),
             new_value: Some("\"Bob\"".to_string()),
             location: None,
+            annotations: Vec::new(),
         }];
         let result = patch_json(original, &changes).unwrap();
         assert!(result.contains("Bob"));
@@ -307,6 +309,7 @@ mod tests {
             old_value: Some("30".to_string()),
             new_value: None,
             location: None,
+            annotations: Vec::new(),
         }];
         let result = patch_json(original, &changes).unwrap();
         assert!(!result.contains("age"));

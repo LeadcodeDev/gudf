@@ -1,0 +1,15 @@
+[package]
+name = "gudf-dir"
+version = "0.1.0"
+edition = "2021"
+description = "Directory tree diff with parallel execution for gudf"
+license = "MIT"
+
+[dependencies]
+gudf = { path = "../gudf" }
+walkdir = "2"
+ignore = "0.4"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"

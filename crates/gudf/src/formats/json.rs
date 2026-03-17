@@ -41,6 +41,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
             old_value: Some(old.to_string()),
             new_value: Some(new.to_string()),
             location: None,
+            annotations: Vec::new(),
         });
         return;
     }
@@ -61,6 +62,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
                         old_value: Some(old_val.to_string()),
                         new_value: None,
                         location: None,
+                        annotations: Vec::new(),
                     }),
                 }
             }
@@ -77,6 +79,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
                         old_value: None,
                         new_value: Some(new_val.to_string()),
                         location: None,
+                        annotations: Vec::new(),
                     });
                 }
             }
@@ -100,6 +103,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
                             old_value: Some(old_val.to_string()),
                             new_value: None,
                             location: None,
+                            annotations: Vec::new(),
                         });
                     }
                     (None, Some(new_val)) => {
@@ -109,6 +113,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
                             old_value: None,
                             new_value: Some(new_val.to_string()),
                             location: None,
+                            annotations: Vec::new(),
                         });
                     }
                     (None, None) => unreachable!(),
@@ -126,6 +131,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
                 old_value: Some(old.to_string()),
                 new_value: Some(new.to_string()),
                 location: None,
+                annotations: Vec::new(),
             });
         }
     }

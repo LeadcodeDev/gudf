@@ -52,6 +52,41 @@ impl OutputFormatter for JsonPatchFormatter {
                         "value": value,
                     }));
                 }
+                ChangeKind::Moved => {
+                    let new_path = change
+                        .new_value
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('.', "/");
+                    let new_json_path = if new_path.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{new_path}")
+                    };
+                    ops.push(serde_json::json!({
+                        "op": "move",
+                        "from": json_path,
+                        "path": new_json_path,
+                    }));
+                }
+                ChangeKind::Renamed => {
+                    // RFC 6902 doesn't have a "rename" op; emit move
+                    let new_path = change
+                        .new_value
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('.', "/");
+                    let new_json_path = if new_path.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{new_path}")
+                    };
+                    ops.push(serde_json::json!({
+                        "op": "move",
+                        "from": json_path,
+                        "path": new_json_path,
+                    }));
+                }
                 ChangeKind::Unchanged => {}
             }
         }

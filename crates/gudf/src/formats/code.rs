@@ -166,6 +166,7 @@ fn diff_nodes(
                 line: old_node.start_position().row + 1,
                 column: Some(old_node.start_position().column),
             }),
+            annotations: Vec::new(),
         });
         return;
     }
@@ -194,6 +195,7 @@ fn diff_nodes(
                         line: old_child.start_position().row + 1,
                         column: Some(old_child.start_position().column),
                     }),
+                    annotations: Vec::new(),
                 });
             }
             (None, Some(new_child)) => {
@@ -207,6 +209,7 @@ fn diff_nodes(
                         line: new_child.start_position().row + 1,
                         column: Some(new_child.start_position().column),
                     }),
+                    annotations: Vec::new(),
                 });
             }
             (None, None) => unreachable!(),
@@ -373,7 +376,6 @@ mod tests {
                 ok_count += 1;
             }
         }
-        // At minimum, the core languages should work
         assert!(ok_count >= 20, "Expected at least 20 languages to parse, got {ok_count}");
     }
 }

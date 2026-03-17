@@ -1,17 +1,29 @@
+pub mod annotations;
 pub mod engine;
 pub mod error;
 pub mod format;
 pub mod formats;
+pub mod merge;
 pub mod output;
 pub mod patch;
+pub mod pipeline;
 pub mod result;
+pub mod semantic;
 
+pub use annotations::{
+    annotate_changes, Annotation, AnnotationValue, Annotator, AstNodeAnnotator,
+    PathDepthAnnotator, SensitiveFieldAnnotator, Severity,
+};
 pub use engine::DiffEngine;
 pub use error::GudfError;
 pub use format::{detect_format, Format, FormatKind};
+pub use formats::cross::{diff_cross, CrossFormatKind};
+pub use merge::{merge, merge_json, Conflict, MergeResult, MergeStrategy};
 pub use output::OutputFormatter;
 pub use patch::Patchable;
+pub use pipeline::DiffPipeline;
 pub use result::{Change, ChangeKind, DiffResult, DiffStats, Location};
+pub use semantic::{SemanticAnalyzer, SemanticOptions};
 
 use formats::code::CodeFormat;
 use formats::json::JsonFormat;

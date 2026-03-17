@@ -33,6 +33,16 @@ impl OutputFormatter for InlineFormatter {
                         output.push_str(&format!("[+] {new_val}\n"));
                     }
                 }
+                ChangeKind::Moved => {
+                    let path = change.path.as_deref().unwrap_or("");
+                    let new_path = change.new_value.as_deref().unwrap_or("");
+                    output.push_str(&format!("[M] {path} -> {new_path}\n"));
+                }
+                ChangeKind::Renamed => {
+                    let path = change.path.as_deref().unwrap_or("");
+                    let new_path = change.new_value.as_deref().unwrap_or("");
+                    output.push_str(&format!("[R] {path} -> {new_path}\n"));
+                }
                 ChangeKind::Unchanged => {
                     let val = change.old_value.as_deref().unwrap_or("");
                     let val = val.trim_end_matches('\n');
@@ -42,9 +52,16 @@ impl OutputFormatter for InlineFormatter {
         }
 
         output.push_str(&format!(
-            "\n{} addition(s), {} deletion(s), {} modification(s)\n",
+            "\n{} addition(s), {} deletion(s), {} modification(s)",
             result.stats.additions, result.stats.deletions, result.stats.modifications
         ));
+        if result.stats.moves > 0 {
+            output.push_str(&format!(", {} move(s)", result.stats.moves));
+        }
+        if result.stats.renames > 0 {
+            output.push_str(&format!(", {} rename(s)", result.stats.renames));
+        }
+        output.push('\n');
 
         output
     }

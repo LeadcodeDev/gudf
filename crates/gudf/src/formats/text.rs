@@ -31,6 +31,7 @@ impl Format for TextFormat {
                                 line,
                                 column: None,
                             }),
+                            annotations: Vec::new(),
                         });
                         continue;
                     }
@@ -56,6 +57,7 @@ impl Format for TextFormat {
                         line,
                         column: None,
                     }),
+                    annotations: Vec::new(),
                 });
             }
         }
