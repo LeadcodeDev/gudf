@@ -40,6 +40,7 @@ pub struct MutationChain {
     original: String,
     format: FormatKind,
     states: Vec<MutationState>,
+    redo_stack: Vec<MutationState>,
 }
 
 impl MutationChain {
@@ -49,14 +50,17 @@ impl MutationChain {
             original: original.into(),
             format,
             states: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
     /// Apply a `DiffResult` as the next mutation.
+    /// Clears the redo stack (new mutation forks the history).
     /// Returns the new document content.
     pub fn mutate(&mut self, diff: &DiffResult) -> Result<&str, GudfError> {
         let base = self.current();
         let document = apply_diff(base, &self.format, diff)?;
+        self.redo_stack.clear();
         self.states.push(MutationState {
             document,
             diff: diff.clone(),
@@ -65,6 +69,7 @@ impl MutationChain {
     }
 
     /// Apply raw changes as the next mutation.
+    /// Clears the redo stack (new mutation forks the history).
     /// The changes are wrapped in a `DiffResult` for bookkeeping.
     pub fn apply(&mut self, changes: &[Change]) -> Result<&str, GudfError> {
         let base = self.current();
@@ -75,6 +80,7 @@ impl MutationChain {
             stats,
         };
         let document = apply_diff(base, &self.format, &diff)?;
+        self.redo_stack.clear();
         self.states.push(MutationState { document, diff });
         Ok(&self.states.last().unwrap().document)
     }
@@ -136,14 +142,86 @@ impl MutationChain {
         self.states.iter().map(|s| &s.diff).collect()
     }
 
-    /// Undo the last mutation. Returns the removed state, or `None` if empty.
-    pub fn undo(&mut self) -> Option<MutationState> {
-        self.states.pop()
+    /// Undo the last mutation, pushing it onto the redo stack.
+    /// Returns `true` if a mutation was undone, `false` if already at original.
+    pub fn undo(&mut self) -> bool {
+        if let Some(state) = self.states.pop() {
+            self.redo_stack.push(state);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Redo the last undone mutation.
+    /// Returns `true` if a mutation was re-applied, `false` if the redo stack is empty.
+    pub fn redo(&mut self) -> bool {
+        if let Some(state) = self.redo_stack.pop() {
+            self.states.push(state);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Undo `n` mutations at once, pushing all of them onto the redo stack.
+    /// Returns the number of mutations actually undone.
+    pub fn undo_n(&mut self, n: usize) -> usize {
+        let mut count = 0;
+        for _ in 0..n {
+            if self.undo() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+
+    /// Redo `n` mutations at once.
+    /// Returns the number of mutations actually redone.
+    pub fn redo_n(&mut self, n: usize) -> usize {
+        let mut count = 0;
+        for _ in 0..n {
+            if self.redo() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+
+    /// Redo all undone mutations.
+    /// Returns the number of mutations redone.
+    pub fn redo_all(&mut self) -> usize {
+        let n = self.redo_stack.len();
+        self.redo_n(n)
+    }
+
+    /// True if there is at least one mutation to undo.
+    pub fn can_undo(&self) -> bool {
+        !self.states.is_empty()
+    }
+
+    /// True if there is at least one mutation to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Number of mutations available for redo.
+    pub fn redo_len(&self) -> usize {
+        self.redo_stack.len()
     }
 
     /// Undo all mutations back to a specific step (0 = original).
+    /// Undone states are pushed onto the redo stack in order.
     pub fn rewind(&mut self, step: usize) {
-        self.states.truncate(step);
+        while self.states.len() > step {
+            if !self.undo() {
+                break;
+            }
+        }
     }
 
     /// Compose all mutations into a single `DiffResult` (original → current).
@@ -184,10 +262,12 @@ impl MutationChain {
 
     /// Squash: compose all mutations into a single diff and replace the history.
     /// After squash, `len() == 1` and the chain holds only original → current.
+    /// Clears the redo stack.
     pub fn squash(&mut self) -> Result<&DiffResult, GudfError> {
         let composed = self.compose()?;
         let document = self.current().to_string();
         self.states.clear();
+        self.redo_stack.clear();
         self.states.push(MutationState {
             document,
             diff: composed,
@@ -311,10 +391,84 @@ mod tests {
         let d = gudf_diff_text("a\n", "b\n");
         chain.mutate(&d).unwrap();
         assert_eq!(chain.current(), "b\n");
+        assert!(chain.can_undo());
+        assert!(!chain.can_redo());
+
+        assert!(chain.undo());
+        assert_eq!(chain.current(), "a\n");
+        assert!(chain.is_empty());
+        assert!(!chain.can_undo());
+        assert!(chain.can_redo());
+
+        // Undo on empty returns false
+        assert!(!chain.undo());
+    }
+
+    #[test]
+    fn test_redo() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        let d = gudf_diff_text("a\n", "b\n");
+        chain.mutate(&d).unwrap();
+        assert_eq!(chain.current(), "b\n");
 
         chain.undo();
         assert_eq!(chain.current(), "a\n");
-        assert!(chain.is_empty());
+        assert!(chain.can_redo());
+        assert_eq!(chain.redo_len(), 1);
+
+        assert!(chain.redo());
+        assert_eq!(chain.current(), "b\n");
+        assert!(!chain.can_redo());
+        assert_eq!(chain.redo_len(), 0);
+
+        // Redo on empty returns false
+        assert!(!chain.redo());
+    }
+
+    #[test]
+    fn test_undo_redo_multiple() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        for (from, to) in [("a\n", "b\n"), ("b\n", "c\n"), ("c\n", "d\n")] {
+            let d = gudf_diff_text(from, to);
+            chain.mutate(&d).unwrap();
+        }
+        assert_eq!(chain.current(), "d\n");
+
+        // Undo 2 at once
+        assert_eq!(chain.undo_n(2), 2);
+        assert_eq!(chain.current(), "b\n");
+        assert_eq!(chain.redo_len(), 2);
+
+        // Redo 1
+        assert!(chain.redo());
+        assert_eq!(chain.current(), "c\n");
+        assert_eq!(chain.redo_len(), 1);
+
+        // Redo the rest
+        assert_eq!(chain.redo_all(), 1);
+        assert_eq!(chain.current(), "d\n");
+        assert_eq!(chain.redo_len(), 0);
+    }
+
+    #[test]
+    fn test_redo_cleared_on_new_mutation() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        let d1 = gudf_diff_text("a\n", "b\n");
+        chain.mutate(&d1).unwrap();
+        let d2 = gudf_diff_text("b\n", "c\n");
+        chain.mutate(&d2).unwrap();
+
+        // Undo → redo stack has 1
+        chain.undo();
+        assert_eq!(chain.current(), "b\n");
+        assert_eq!(chain.redo_len(), 1);
+
+        // New mutation forks: redo stack is cleared
+        let d3 = gudf_diff_text("b\n", "x\n");
+        chain.mutate(&d3).unwrap();
+        assert_eq!(chain.current(), "x\n");
+        assert_eq!(chain.redo_len(), 0);
+        assert!(!chain.can_redo());
     }
 
     #[test]
@@ -331,6 +485,12 @@ mod tests {
         chain.rewind(1);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.current(), "b\n");
+        // Rewound states are on the redo stack
+        assert_eq!(chain.redo_len(), 2);
+
+        // Can redo back to d
+        chain.redo_all();
+        assert_eq!(chain.current(), "d\n");
     }
 
     #[test]
@@ -490,11 +650,11 @@ mod tests {
     }
 
     #[test]
-    fn test_json_undo_redo_pattern() {
+    fn test_json_undo_redo_cycle() {
         let original = r#"{"count":0}"#;
         let mut chain = MutationChain::new(original, FormatKind::Json);
 
-        // Increment 3 times
+        // Increment 3 times: 0 → 1 → 2 → 3
         for i in 1..=3 {
             let prev = chain.current().to_string();
             let next = format!(r#"{{"count":{i}}}"#);
@@ -506,10 +666,21 @@ mod tests {
         assert_eq!(val["count"], 3);
 
         // Undo twice → count should be 1
-        chain.undo();
-        chain.undo();
+        assert_eq!(chain.undo_n(2), 2);
         let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
         assert_eq!(val["count"], 1);
+        assert_eq!(chain.redo_len(), 2);
+
+        // Redo once → count should be 2
+        chain.redo();
+        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(val["count"], 2);
+
+        // Redo again → count should be 3
+        chain.redo();
+        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(val["count"], 3);
+        assert!(!chain.can_redo());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

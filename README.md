@@ -345,12 +345,22 @@ chain.at(2); // state after 2nd mutation
 let history = chain.history();
 assert_eq!(history.len(), 4);
 
-// Undo the last mutation
-chain.undo();
-assert_eq!(chain.len(), 2);
+// Undo / Redo
+chain.undo();                 // steps back one mutation
+assert_eq!(chain.can_redo(), true);
+chain.redo();                 // re-applies the undone mutation
 
-// Rewind to step 1 (discard mutations 2+)
+chain.undo_n(2);              // undo 2 at once
+chain.redo_all();             // redo everything on the redo stack
+
+// New mutation after undo forks the history (clears redo stack)
+chain.undo();
+chain.mutate(&some_diff)?;   // redo stack is now empty
+assert_eq!(chain.can_redo(), false);
+
+// Rewind to step 1 (undone states go to redo stack)
 chain.rewind(1);
+chain.redo_all();             // can recover them
 
 // Compose all mutations into a single diff (original → current)
 let composed = chain.compose()?;
@@ -388,20 +398,26 @@ chain.apply(&changes)?;
 
 Key capabilities:
 
-| Method          | Description                                           |
-| --------------- | ----------------------------------------------------- |
-| `mutate(diff)`  | Apply a `DiffResult` as the next mutation              |
-| `apply(changes)`| Apply raw `Change` slice as a mutation                 |
-| `current()`     | Document content after all mutations                   |
-| `at(step)`      | Document at step N (0 = original)                      |
-| `history()`     | All states: `[original, after_1, ..., after_N]`        |
-| `undo()`        | Remove the last mutation, returns the removed state    |
-| `rewind(step)`  | Truncate history to step N                             |
-| `compose()`     | Single diff from original to current                   |
-| `compose_range(from, to)` | Single diff between two steps               |
-| `squash()`      | Collapse all mutations into one                        |
-| `total_stats()` | Cumulative stats across all mutations                  |
-| `diffs()`       | All applied `DiffResult`s in order                     |
+| Method                    | Description                                            |
+| ------------------------- | ------------------------------------------------------ |
+| `mutate(diff)`            | Apply a `DiffResult` as the next mutation               |
+| `apply(changes)`          | Apply raw `Change` slice as a mutation                  |
+| `current()`               | Document content after all mutations                    |
+| `at(step)`                | Document at step N (0 = original)                       |
+| `history()`               | All states: `[original, after_1, ..., after_N]`         |
+| `undo()`                  | Undo last mutation (pushed to redo stack)                |
+| `redo()`                  | Re-apply last undone mutation                           |
+| `undo_n(n)`               | Undo N mutations at once                                |
+| `redo_n(n)`               | Redo N mutations at once                                |
+| `redo_all()`              | Redo all undone mutations                               |
+| `can_undo()` / `can_redo()` | Check if undo/redo is available                      |
+| `redo_len()`              | Number of redoable mutations                            |
+| `rewind(step)`            | Undo back to step N (undone states go to redo stack)    |
+| `compose()`               | Single diff from original to current                    |
+| `compose_range(from, to)` | Single diff between two steps                          |
+| `squash()`                | Collapse all mutations into one (clears redo)           |
+| `total_stats()`           | Cumulative stats across all mutations                   |
+| `diffs()`                 | All applied `DiffResult`s in order                      |
 
 ## Supported Formats
 
