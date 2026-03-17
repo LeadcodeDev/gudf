@@ -317,6 +317,92 @@ Merge strategies:
 | `Ours`   | Left side wins on conflict          |
 | `Theirs` | Right side wins on conflict         |
 
+### Mutation Chains
+
+Reconstruct a document through a sequence of diffs, with full history tracking, undo, rewind, and composition.
+
+```rust
+use gudf::{MutationChain, FormatKind};
+
+// Start from an original document
+let mut chain = MutationChain::new(r#"{"version": 1}"#, FormatKind::Json);
+
+// Apply successive mutations
+let diff1 = gudf::diff_json(r#"{"version": 1}"#, r#"{"version": 2}"#)?;
+chain.mutate(&diff1)?;
+
+let diff2 = gudf::diff_json(chain.current(), r#"{"version": 2, "name": "gudf"}"#)?;
+chain.mutate(&diff2)?;
+
+let diff3 = gudf::diff_json(chain.current(), r#"{"version": 3, "name": "gudf"}"#)?;
+chain.mutate(&diff3)?;
+
+// Inspect any state (0 = original)
+assert_eq!(chain.at(0), Some(r#"{"version": 1}"#));
+chain.at(2); // state after 2nd mutation
+
+// Full history: [original, after_1, after_2, after_3]
+let history = chain.history();
+assert_eq!(history.len(), 4);
+
+// Undo the last mutation
+chain.undo();
+assert_eq!(chain.len(), 2);
+
+// Rewind to step 1 (discard mutations 2+)
+chain.rewind(1);
+
+// Compose all mutations into a single diff (original → current)
+let composed = chain.compose()?;
+
+// Compose a sub-range (step 1 → step 3)
+let partial = chain.compose_range(1, 3)?;
+
+// Squash: collapse all mutations into one step
+chain.squash()?;
+assert_eq!(chain.len(), 1);
+
+// Cumulative stats across all mutations
+let stats = chain.total_stats();
+```
+
+You can also apply raw changes directly:
+
+```rust
+use gudf::{MutationChain, Change, ChangeKind, FormatKind};
+
+let mut chain = MutationChain::new(r#"{"a": 1}"#, FormatKind::Json);
+
+let changes = vec![Change {
+    kind: ChangeKind::Modified,
+    path: Some("a".to_string()),
+    old_value: Some("1".to_string()),
+    new_value: Some("99".to_string()),
+    location: None,
+    annotations: Vec::new(),
+}];
+
+chain.apply(&changes)?;
+// chain.current() → {"a": 99}
+```
+
+Key capabilities:
+
+| Method          | Description                                           |
+| --------------- | ----------------------------------------------------- |
+| `mutate(diff)`  | Apply a `DiffResult` as the next mutation              |
+| `apply(changes)`| Apply raw `Change` slice as a mutation                 |
+| `current()`     | Document content after all mutations                   |
+| `at(step)`      | Document at step N (0 = original)                      |
+| `history()`     | All states: `[original, after_1, ..., after_N]`        |
+| `undo()`        | Remove the last mutation, returns the removed state    |
+| `rewind(step)`  | Truncate history to step N                             |
+| `compose()`     | Single diff from original to current                   |
+| `compose_range(from, to)` | Single diff between two steps               |
+| `squash()`      | Collapse all mutations into one                        |
+| `total_stats()` | Cumulative stats across all mutations                  |
+| `diffs()`       | All applied `DiffResult`s in order                     |
+
 ## Supported Formats
 
 ### Structured
@@ -408,6 +494,7 @@ crates/
       annotations.rs   Annotation types, Annotator trait, built-in annotators
       semantic.rs      SemanticAnalyzer — move/rename detection
       merge.rs         Three-way structural merge
+      mutation.rs      MutationChain — sequential diff replay and composition
       formats/
         text.rs        Line-by-line diff (similar crate)
         json.rs        Recursive JSON diff
