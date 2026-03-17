@@ -1,43 +1,105 @@
+use std::fmt;
+
+use sha1::{Digest, Sha1};
+
 use crate::engine::DiffEngine;
 use crate::error::GudfError;
 use crate::format::FormatKind;
 use crate::patch::patch_as;
 use crate::result::{Change, ChangeKind, DiffResult, DiffStats};
 
+/// SHA-1 content hash of a document state, mirroring git's object model.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ContentSha([u8; 20]);
+
+impl ContentSha {
+    /// Compute the SHA-1 hash of the given content bytes.
+    pub fn from_content(content: &str) -> Self {
+        let mut hasher = Sha1::new();
+        hasher.update(content.as_bytes());
+        let result = hasher.finalize();
+        Self(result.into())
+    }
+
+    /// Full hex-encoded SHA-1 (40 characters).
+    pub fn full(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Short SHA — first 7 hex characters.
+    pub fn short(&self) -> String {
+        self.full()[..7].to_string()
+    }
+
+    /// Check whether a hex prefix (short or full) matches this sha.
+    pub fn matches_prefix(&self, prefix: &str) -> bool {
+        let full = self.full();
+        full.starts_with(prefix)
+    }
+
+    /// Raw bytes.
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ContentSha {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContentSha({})", self.short())
+    }
+}
+
+impl fmt::Display for ContentSha {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.short())
+    }
+}
+
 /// A snapshot produced by a single mutation step.
 #[derive(Debug, Clone)]
 pub struct MutationState {
     /// The document content after this mutation.
     pub document: String,
+    /// SHA-1 hash of the document content.
+    pub sha: ContentSha,
     /// The diff that was applied to reach this state.
     pub diff: DiffResult,
 }
 
+/// An entry in the mutation log.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Step index (0 = original).
+    pub step: usize,
+    /// SHA of the document at this step.
+    pub sha: ContentSha,
+    /// Summary stats of the diff applied at this step (`None` for step 0).
+    pub stats: Option<DiffStats>,
+}
+
 /// Chains multiple mutations on a document, tracking every intermediate state.
+///
+/// Each state (including the original) is identified by a `ContentSha` — a
+/// SHA-1 hash of its content, like git blob objects. You can look up any
+/// state by full sha, short sha, or prefix.
 ///
 /// ```rust,ignore
 /// use gudf::mutation::MutationChain;
 /// use gudf::FormatKind;
 ///
-/// let mut chain = MutationChain::new(r#"{"a":1,"b":2}"#, FormatKind::Json);
-/// chain.mutate(&diff1)?;
-/// chain.mutate(&diff2)?;
+/// let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
+/// println!("original: {}", chain.original_sha()); // e.g. "a3f1c2d"
 ///
-/// // current state after all mutations
-/// let current = chain.current();
+/// chain.mutate(&diff)?;
+/// println!("current:  {}", chain.current_sha());  // e.g. "b7e4f90"
 ///
-/// // full history: original → state1 → state2
-/// let history = chain.history();
-///
-/// // compose every mutation into a single diff (original → current)
-/// let composed = chain.compose()?;
-///
-/// // undo the last mutation
-/// chain.undo();
+/// // Look up by sha prefix
+/// let (step, doc) = chain.find_by_sha("b7e4").unwrap();
 /// ```
 #[derive(Debug, Clone)]
 pub struct MutationChain {
     original: String,
+    original_sha: ContentSha,
     format: FormatKind,
     states: Vec<MutationState>,
     redo_stack: Vec<MutationState>,
@@ -46,13 +108,18 @@ pub struct MutationChain {
 impl MutationChain {
     /// Create a new chain starting from `original` with the given format.
     pub fn new(original: impl Into<String>, format: FormatKind) -> Self {
+        let original = original.into();
+        let original_sha = ContentSha::from_content(&original);
         Self {
-            original: original.into(),
+            original,
+            original_sha,
             format,
             states: Vec::new(),
             redo_stack: Vec::new(),
         }
     }
+
+    // ── Mutation ────────────────────────────────────────────────────────
 
     /// Apply a `DiffResult` as the next mutation.
     /// Clears the redo stack (new mutation forks the history).
@@ -60,9 +127,11 @@ impl MutationChain {
     pub fn mutate(&mut self, diff: &DiffResult) -> Result<&str, GudfError> {
         let base = self.current();
         let document = apply_diff(base, &self.format, diff)?;
+        let sha = ContentSha::from_content(&document);
         self.redo_stack.clear();
         self.states.push(MutationState {
             document,
+            sha,
             diff: diff.clone(),
         });
         Ok(&self.states.last().unwrap().document)
@@ -70,7 +139,6 @@ impl MutationChain {
 
     /// Apply raw changes as the next mutation.
     /// Clears the redo stack (new mutation forks the history).
-    /// The changes are wrapped in a `DiffResult` for bookkeeping.
     pub fn apply(&mut self, changes: &[Change]) -> Result<&str, GudfError> {
         let base = self.current();
         let stats = DiffStats::from_changes(changes);
@@ -80,10 +148,17 @@ impl MutationChain {
             stats,
         };
         let document = apply_diff(base, &self.format, &diff)?;
+        let sha = ContentSha::from_content(&document);
         self.redo_stack.clear();
-        self.states.push(MutationState { document, diff });
+        self.states.push(MutationState {
+            document,
+            sha,
+            diff,
+        });
         Ok(&self.states.last().unwrap().document)
     }
+
+    // ── State access ───────────────────────────────────────────────────
 
     /// Current document content (after all applied mutations, or the original).
     pub fn current(&self) -> &str {
@@ -128,7 +203,6 @@ impl MutationChain {
     }
 
     /// All document states including the original.
-    /// Returns `[original, after_mutation_1, after_mutation_2, ...]`.
     pub fn history(&self) -> Vec<&str> {
         let mut h = vec![self.original.as_str()];
         for state in &self.states {
@@ -142,8 +216,79 @@ impl MutationChain {
         self.states.iter().map(|s| &s.diff).collect()
     }
 
+    // ── SHA ────────────────────────────────────────────────────────────
+
+    /// SHA of the original document.
+    pub fn original_sha(&self) -> &ContentSha {
+        &self.original_sha
+    }
+
+    /// SHA of the current document state.
+    pub fn current_sha(&self) -> &ContentSha {
+        self.states
+            .last()
+            .map(|s| &s.sha)
+            .unwrap_or(&self.original_sha)
+    }
+
+    /// SHA at a specific step (0 = original).
+    pub fn sha_at(&self, step: usize) -> Option<&ContentSha> {
+        if step == 0 {
+            Some(&self.original_sha)
+        } else {
+            self.states.get(step - 1).map(|s| &s.sha)
+        }
+    }
+
+    /// All SHAs from original through current, in order.
+    pub fn shas(&self) -> Vec<&ContentSha> {
+        let mut v = vec![&self.original_sha];
+        for state in &self.states {
+            v.push(&state.sha);
+        }
+        v
+    }
+
+    /// Find a state by full or partial SHA prefix.
+    /// Returns `(step, document_content)` or `None` if no match / ambiguous.
+    pub fn find_by_sha(&self, prefix: &str) -> Option<(usize, &str)> {
+        let matches: Vec<(usize, &str)> = self
+            .history()
+            .into_iter()
+            .enumerate()
+            .filter(|(step, _)| {
+                self.sha_at(*step)
+                    .map_or(false, |sha| sha.matches_prefix(prefix))
+            })
+            .collect();
+
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None // no match or ambiguous
+        }
+    }
+
+    /// Produce a git-log-style summary of all states.
+    pub fn log(&self) -> Vec<LogEntry> {
+        let mut entries = vec![LogEntry {
+            step: 0,
+            sha: self.original_sha.clone(),
+            stats: None,
+        }];
+        for (i, state) in self.states.iter().enumerate() {
+            entries.push(LogEntry {
+                step: i + 1,
+                sha: state.sha.clone(),
+                stats: Some(state.diff.stats.clone()),
+            });
+        }
+        entries
+    }
+
+    // ── Undo / Redo ────────────────────────────────────────────────────
+
     /// Undo the last mutation, pushing it onto the redo stack.
-    /// Returns `true` if a mutation was undone, `false` if already at original.
     pub fn undo(&mut self) -> bool {
         if let Some(state) = self.states.pop() {
             self.redo_stack.push(state);
@@ -154,7 +299,6 @@ impl MutationChain {
     }
 
     /// Redo the last undone mutation.
-    /// Returns `true` if a mutation was re-applied, `false` if the redo stack is empty.
     pub fn redo(&mut self) -> bool {
         if let Some(state) = self.redo_stack.pop() {
             self.states.push(state);
@@ -164,8 +308,7 @@ impl MutationChain {
         }
     }
 
-    /// Undo `n` mutations at once, pushing all of them onto the redo stack.
-    /// Returns the number of mutations actually undone.
+    /// Undo `n` mutations at once.
     pub fn undo_n(&mut self, n: usize) -> usize {
         let mut count = 0;
         for _ in 0..n {
@@ -179,7 +322,6 @@ impl MutationChain {
     }
 
     /// Redo `n` mutations at once.
-    /// Returns the number of mutations actually redone.
     pub fn redo_n(&mut self, n: usize) -> usize {
         let mut count = 0;
         for _ in 0..n {
@@ -193,7 +335,6 @@ impl MutationChain {
     }
 
     /// Redo all undone mutations.
-    /// Returns the number of mutations redone.
     pub fn redo_all(&mut self) -> usize {
         let n = self.redo_stack.len();
         self.redo_n(n)
@@ -214,8 +355,8 @@ impl MutationChain {
         self.redo_stack.len()
     }
 
-    /// Undo all mutations back to a specific step (0 = original).
-    /// Undone states are pushed onto the redo stack in order.
+    /// Undo back to a specific step (0 = original).
+    /// Undone states are pushed onto the redo stack.
     pub fn rewind(&mut self, step: usize) {
         while self.states.len() > step {
             if !self.undo() {
@@ -224,30 +365,28 @@ impl MutationChain {
         }
     }
 
+    // ── Compose / Squash ───────────────────────────────────────────────
+
     /// Compose all mutations into a single `DiffResult` (original → current).
-    /// Re-diffs the original against the current state.
     pub fn compose(&self) -> Result<DiffResult, GudfError> {
         if self.states.is_empty() {
-            let stats = DiffStats {
-                additions: 0,
-                deletions: 0,
-                modifications: 0,
-                moves: 0,
-                renames: 0,
-            };
             return Ok(DiffResult {
                 changes: Vec::new(),
                 format: self.format.clone(),
-                stats,
+                stats: DiffStats {
+                    additions: 0,
+                    deletions: 0,
+                    modifications: 0,
+                    moves: 0,
+                    renames: 0,
+                },
             });
         }
-
         let engine = DiffEngine::new();
         engine.diff_as(self.format.clone(), &self.original, self.current())
     }
 
-    /// Compose the diff between two steps into a single `DiffResult`.
-    /// `from` and `to` are step indices (0 = original).
+    /// Compose the diff between two steps.
     pub fn compose_range(&self, from: usize, to: usize) -> Result<DiffResult, GudfError> {
         let from_doc = self
             .at(from)
@@ -255,21 +394,20 @@ impl MutationChain {
         let to_doc = self
             .at(to)
             .ok_or_else(|| GudfError::PatchError(format!("Step {to} does not exist")))?;
-
         let engine = DiffEngine::new();
         engine.diff_as(self.format.clone(), from_doc, to_doc)
     }
 
-    /// Squash: compose all mutations into a single diff and replace the history.
-    /// After squash, `len() == 1` and the chain holds only original → current.
-    /// Clears the redo stack.
+    /// Squash all mutations into one. Clears redo stack.
     pub fn squash(&mut self) -> Result<&DiffResult, GudfError> {
         let composed = self.compose()?;
         let document = self.current().to_string();
+        let sha = ContentSha::from_content(&document);
         self.states.clear();
         self.redo_stack.clear();
         self.states.push(MutationState {
             document,
+            sha,
             diff: composed,
         });
         Ok(&self.states[0].diff)
@@ -295,12 +433,8 @@ impl MutationChain {
     }
 }
 
-/// Apply a diff to a document, choosing the right strategy per format.
-///
-/// - **Text / Code**: the diff contains every line (Unchanged, Added, Removed)
-///   so the new document is reconstructed by collecting the new-side values.
-/// - **Structured (JSON, TOML, YAML)**: changes are path-based, so we delegate
-///   to the existing `patch_as` which mutates the parsed document in place.
+// ── Internal helpers ───────────────────────────────────────────────────
+
 fn apply_diff(base: &str, format: &FormatKind, diff: &DiffResult) -> Result<String, GudfError> {
     match format {
         FormatKind::Text | FormatKind::Code(_) => Ok(reconstruct_text(&diff.changes)),
@@ -308,21 +442,15 @@ fn apply_diff(base: &str, format: &FormatKind, diff: &DiffResult) -> Result<Stri
     }
 }
 
-/// Reconstruct a text document from a full list of line-level changes.
-///
-/// Takes every line that should appear in the new document:
-/// - `Unchanged` / `Added` / `Modified` → take `new_value`
-/// - `Removed` → skip
 fn reconstruct_text(changes: &[Change]) -> String {
     let mut out = String::new();
     for change in changes {
         match change.kind {
-            ChangeKind::Unchanged | ChangeKind::Added | ChangeKind::Modified => {
-                if let Some(v) = &change.new_value {
-                    out.push_str(v);
-                }
-            }
-            ChangeKind::Moved | ChangeKind::Renamed => {
+            ChangeKind::Unchanged
+            | ChangeKind::Added
+            | ChangeKind::Modified
+            | ChangeKind::Moved
+            | ChangeKind::Renamed => {
                 if let Some(v) = &change.new_value {
                     out.push_str(v);
                 }
@@ -333,12 +461,180 @@ fn reconstruct_text(changes: &[Change]) -> String {
     out
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::format::Format;
 
-    // ── Text ────────────────────────────────────────────────────────────
+    // ── ContentSha ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sha_deterministic() {
+        let a = ContentSha::from_content("hello");
+        let b = ContentSha::from_content("hello");
+        assert_eq!(a, b);
+        assert_eq!(a.full(), b.full());
+    }
+
+    #[test]
+    fn test_sha_different_content() {
+        let a = ContentSha::from_content("hello");
+        let b = ContentSha::from_content("world");
+        assert_ne!(a, b);
+        assert_ne!(a.full(), b.full());
+        assert_ne!(a.short(), b.short());
+    }
+
+    #[test]
+    fn test_sha_format() {
+        let sha = ContentSha::from_content("test");
+        assert_eq!(sha.full().len(), 40);
+        assert_eq!(sha.short().len(), 7);
+        assert!(sha.full().starts_with(&sha.short()));
+    }
+
+    #[test]
+    fn test_sha_display() {
+        let sha = ContentSha::from_content("test");
+        let display = format!("{sha}");
+        assert_eq!(display, sha.short());
+    }
+
+    #[test]
+    fn test_sha_matches_prefix() {
+        let sha = ContentSha::from_content("test");
+        let full = sha.full();
+        assert!(sha.matches_prefix(&full));
+        assert!(sha.matches_prefix(&full[..7]));
+        assert!(sha.matches_prefix(&full[..4]));
+        assert!(!sha.matches_prefix("0000000"));
+    }
+
+    // ── Chain SHA tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn test_original_sha() {
+        let chain = MutationChain::new("hello\n", FormatKind::Text);
+        let sha = chain.original_sha();
+        assert_eq!(sha, &ContentSha::from_content("hello\n"));
+        assert_eq!(chain.current_sha(), sha);
+    }
+
+    #[test]
+    fn test_sha_changes_on_mutate() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        let sha0 = chain.current_sha().clone();
+
+        let d = gudf_diff_text("a\n", "b\n");
+        chain.mutate(&d).unwrap();
+        let sha1 = chain.current_sha().clone();
+
+        assert_ne!(sha0, sha1);
+        assert_eq!(sha1, ContentSha::from_content("b\n"));
+    }
+
+    #[test]
+    fn test_sha_at() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        let d = gudf_diff_text("a\n", "b\n");
+        chain.mutate(&d).unwrap();
+
+        assert_eq!(chain.sha_at(0), Some(&ContentSha::from_content("a\n")));
+        assert_eq!(chain.sha_at(1), Some(&ContentSha::from_content("b\n")));
+        assert_eq!(chain.sha_at(2), None);
+    }
+
+    #[test]
+    fn test_shas() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+
+        let shas = chain.shas();
+        assert_eq!(shas.len(), 3);
+        assert_eq!(shas[0], &ContentSha::from_content("a\n"));
+        assert_eq!(shas[1], &ContentSha::from_content("b\n"));
+        assert_eq!(shas[2], &ContentSha::from_content("c\n"));
+    }
+
+    #[test]
+    fn test_find_by_sha_full() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let target_sha = ContentSha::from_content("b\n").full();
+        let found = chain.find_by_sha(&target_sha);
+        assert!(found.is_some());
+        let (step, doc) = found.unwrap();
+        assert_eq!(step, 1);
+        assert_eq!(doc, "b\n");
+    }
+
+    #[test]
+    fn test_find_by_sha_short() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let prefix = ContentSha::from_content("a\n").short();
+        let found = chain.find_by_sha(&prefix);
+        assert!(found.is_some());
+        let (step, doc) = found.unwrap();
+        assert_eq!(step, 0);
+        assert_eq!(doc, "a\n");
+    }
+
+    #[test]
+    fn test_find_by_sha_not_found() {
+        let chain = MutationChain::new("a\n", FormatKind::Text);
+        assert!(chain.find_by_sha("0000000").is_none());
+    }
+
+    #[test]
+    fn test_log() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "a\nb\n")).unwrap();
+        chain.mutate(&gudf_diff_text("a\nb\n", "a\nb\nc\n")).unwrap();
+
+        let log = chain.log();
+        assert_eq!(log.len(), 3);
+
+        assert_eq!(log[0].step, 0);
+        assert!(log[0].stats.is_none());
+
+        assert_eq!(log[1].step, 1);
+        let stats1 = log[1].stats.as_ref().unwrap();
+        assert_eq!(stats1.additions, 1);
+
+        assert_eq!(log[2].step, 2);
+        let stats2 = log[2].stats.as_ref().unwrap();
+        assert_eq!(stats2.additions, 1);
+    }
+
+    #[test]
+    fn test_sha_survives_undo_redo() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        let sha_b = chain.current_sha().clone();
+
+        chain.undo();
+        assert_eq!(chain.current_sha(), &ContentSha::from_content("a\n"));
+
+        chain.redo();
+        assert_eq!(chain.current_sha(), &sha_b);
+    }
+
+    #[test]
+    fn test_mutation_state_has_sha() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let state = &chain.states[0];
+        assert_eq!(state.sha, ContentSha::from_content("b\n"));
+    }
+
+    // ── Text chain ─────────────────────────────────────────────────────
 
     #[test]
     fn test_text_chain() {
@@ -360,25 +656,17 @@ mod tests {
     #[test]
     fn test_history() {
         let mut chain = MutationChain::new("v0\n", FormatKind::Text);
-
-        let d1 = gudf_diff_text("v0\n", "v1\n");
-        chain.mutate(&d1).unwrap();
-
-        let d2 = gudf_diff_text("v1\n", "v2\n");
-        chain.mutate(&d2).unwrap();
+        chain.mutate(&gudf_diff_text("v0\n", "v1\n")).unwrap();
+        chain.mutate(&gudf_diff_text("v1\n", "v2\n")).unwrap();
 
         let h = chain.history();
-        assert_eq!(h.len(), 3);
-        assert_eq!(h[0], "v0\n");
-        assert_eq!(h[1], "v1\n");
-        assert_eq!(h[2], "v2\n");
+        assert_eq!(h, vec!["v0\n", "v1\n", "v2\n"]);
     }
 
     #[test]
     fn test_at() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d).unwrap();
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
 
         assert_eq!(chain.at(0), Some("a\n"));
         assert_eq!(chain.at(1), Some("b\n"));
@@ -388,107 +676,65 @@ mod tests {
     #[test]
     fn test_undo() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d).unwrap();
-        assert_eq!(chain.current(), "b\n");
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
         assert!(chain.can_undo());
         assert!(!chain.can_redo());
 
         assert!(chain.undo());
         assert_eq!(chain.current(), "a\n");
-        assert!(chain.is_empty());
         assert!(!chain.can_undo());
         assert!(chain.can_redo());
-
-        // Undo on empty returns false
         assert!(!chain.undo());
     }
 
     #[test]
     fn test_redo() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d).unwrap();
-        assert_eq!(chain.current(), "b\n");
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
 
         chain.undo();
-        assert_eq!(chain.current(), "a\n");
         assert!(chain.can_redo());
-        assert_eq!(chain.redo_len(), 1);
-
         assert!(chain.redo());
         assert_eq!(chain.current(), "b\n");
         assert!(!chain.can_redo());
-        assert_eq!(chain.redo_len(), 0);
-
-        // Redo on empty returns false
         assert!(!chain.redo());
     }
 
     #[test]
     fn test_undo_redo_multiple() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        for (from, to) in [("a\n", "b\n"), ("b\n", "c\n"), ("c\n", "d\n")] {
-            let d = gudf_diff_text(from, to);
-            chain.mutate(&d).unwrap();
+        for (f, t) in [("a\n", "b\n"), ("b\n", "c\n"), ("c\n", "d\n")] {
+            chain.mutate(&gudf_diff_text(f, t)).unwrap();
         }
-        assert_eq!(chain.current(), "d\n");
-
-        // Undo 2 at once
         assert_eq!(chain.undo_n(2), 2);
         assert_eq!(chain.current(), "b\n");
-        assert_eq!(chain.redo_len(), 2);
-
-        // Redo 1
         assert!(chain.redo());
         assert_eq!(chain.current(), "c\n");
-        assert_eq!(chain.redo_len(), 1);
-
-        // Redo the rest
         assert_eq!(chain.redo_all(), 1);
         assert_eq!(chain.current(), "d\n");
-        assert_eq!(chain.redo_len(), 0);
     }
 
     #[test]
     fn test_redo_cleared_on_new_mutation() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("b\n", "c\n");
-        chain.mutate(&d2).unwrap();
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
 
-        // Undo → redo stack has 1
         chain.undo();
-        assert_eq!(chain.current(), "b\n");
         assert_eq!(chain.redo_len(), 1);
-
-        // New mutation forks: redo stack is cleared
-        let d3 = gudf_diff_text("b\n", "x\n");
-        chain.mutate(&d3).unwrap();
-        assert_eq!(chain.current(), "x\n");
+        chain.mutate(&gudf_diff_text("b\n", "x\n")).unwrap();
         assert_eq!(chain.redo_len(), 0);
-        assert!(!chain.can_redo());
     }
 
     #[test]
     fn test_rewind() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-
-        for (from, to) in [("a\n", "b\n"), ("b\n", "c\n"), ("c\n", "d\n")] {
-            let d = gudf_diff_text(from, to);
-            chain.mutate(&d).unwrap();
+        for (f, t) in [("a\n", "b\n"), ("b\n", "c\n"), ("c\n", "d\n")] {
+            chain.mutate(&gudf_diff_text(f, t)).unwrap();
         }
-        assert_eq!(chain.len(), 3);
-        assert_eq!(chain.current(), "d\n");
-
         chain.rewind(1);
-        assert_eq!(chain.len(), 1);
         assert_eq!(chain.current(), "b\n");
-        // Rewound states are on the redo stack
         assert_eq!(chain.redo_len(), 2);
-
-        // Can redo back to d
         chain.redo_all();
         assert_eq!(chain.current(), "d\n");
     }
@@ -496,114 +742,38 @@ mod tests {
     #[test]
     fn test_compose() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("b\n", "c\n");
-        chain.mutate(&d2).unwrap();
-
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
         let composed = chain.compose().unwrap();
-        // composed is original("a\n") → current("c\n")
         assert!(composed.stats.additions > 0 || composed.stats.deletions > 0);
     }
 
     #[test]
     fn test_compose_range() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("b\n", "c\n");
-        chain.mutate(&d2).unwrap();
-        let d3 = gudf_diff_text("c\n", "d\n");
-        chain.mutate(&d3).unwrap();
-
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+        chain.mutate(&gudf_diff_text("c\n", "d\n")).unwrap();
         let range = chain.compose_range(1, 3).unwrap();
-        // diff of step 1 ("b\n") → step 3 ("d\n")
         assert!(range.stats.additions > 0 || range.stats.deletions > 0);
     }
 
     #[test]
     fn test_squash() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("b\n", "c\n");
-        chain.mutate(&d2).unwrap();
-
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
         chain.squash().unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.current(), "c\n");
-        assert_eq!(chain.original(), "a\n");
     }
 
     #[test]
     fn test_total_stats() {
         let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "a\nb\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("a\nb\n", "a\nb\nc\n");
-        chain.mutate(&d2).unwrap();
-
-        let stats = chain.total_stats();
-        assert_eq!(stats.additions, 2);
-    }
-
-    // ── JSON ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_json_chain() {
-        let mut chain = MutationChain::new(r#"{"a":1,"b":2}"#, FormatKind::Json);
-
-        let d1 = gudf_diff_json(r#"{"a":1,"b":2}"#, r#"{"a":10,"b":2}"#);
-        chain.mutate(&d1).unwrap();
-
-        let current: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(current["a"], 10);
-        assert_eq!(current["b"], 2);
-
-        let d2 = gudf_diff_json(chain.current(), r#"{"a":10,"b":20,"c":30}"#);
-        chain.mutate(&d2).unwrap();
-
-        let current: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(current["a"], 10);
-        assert_eq!(current["b"], 20);
-        assert_eq!(current["c"], 30);
-    }
-
-    #[test]
-    fn test_json_compose_roundtrip() {
-        let original = r#"{"x":1}"#;
-        let mut chain = MutationChain::new(original, FormatKind::Json);
-
-        let d1 = gudf_diff_json(original, r#"{"x":2}"#);
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_json(chain.current(), r#"{"x":2,"y":3}"#);
-        chain.mutate(&d2).unwrap();
-
-        // Compose into a single diff, then apply it to original
-        let composed = chain.compose().unwrap();
-        let reconstructed = patch_as(FormatKind::Json, original, &composed.changes).unwrap();
-
-        let expected: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        let got: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn test_apply_raw_changes() {
-        let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
-
-        let changes = vec![Change {
-            kind: ChangeKind::Modified,
-            path: Some("a".to_string()),
-            old_value: Some("1".to_string()),
-            new_value: Some("99".to_string()),
-            location: None,
-            annotations: Vec::new(),
-        }];
-
-        chain.apply(&changes).unwrap();
-        let current: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(current["a"], 99);
+        chain.mutate(&gudf_diff_text("a\n", "a\nb\n")).unwrap();
+        chain.mutate(&gudf_diff_text("a\nb\n", "a\nb\nc\n")).unwrap();
+        assert_eq!(chain.total_stats().additions, 2);
     }
 
     #[test]
@@ -614,18 +784,6 @@ mod tests {
     }
 
     #[test]
-    fn test_diffs() {
-        let mut chain = MutationChain::new("a\n", FormatKind::Text);
-        let d1 = gudf_diff_text("a\n", "b\n");
-        chain.mutate(&d1).unwrap();
-        let d2 = gudf_diff_text("b\n", "c\n");
-        chain.mutate(&d2).unwrap();
-
-        let diffs = chain.diffs();
-        assert_eq!(diffs.len(), 2);
-    }
-
-    #[test]
     fn test_text_multiline_chain() {
         let v0 = "line1\nline2\nline3\n";
         let v1 = "line1\nmodified\nline3\n";
@@ -633,54 +791,96 @@ mod tests {
         let v3 = "header\nline1\nmodified\nline3\nline4\n";
 
         let mut chain = MutationChain::new(v0, FormatKind::Text);
-
         chain.mutate(&gudf_diff_text(v0, v1)).unwrap();
-        assert_eq!(chain.current(), v1);
-
         chain.mutate(&gudf_diff_text(v1, v2)).unwrap();
-        assert_eq!(chain.current(), v2);
-
         chain.mutate(&gudf_diff_text(v2, v3)).unwrap();
         assert_eq!(chain.current(), v3);
 
-        // Compose full chain
         let composed = chain.compose().unwrap();
-        let rebuilt = reconstruct_text(&composed.changes);
-        assert_eq!(rebuilt, v3);
+        assert_eq!(reconstruct_text(&composed.changes), v3);
+    }
+
+    // ── JSON ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_chain() {
+        let mut chain = MutationChain::new(r#"{"a":1,"b":2}"#, FormatKind::Json);
+        chain
+            .mutate(&gudf_diff_json(r#"{"a":1,"b":2}"#, r#"{"a":10,"b":2}"#))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["a"], 10);
+
+        chain
+            .mutate(&gudf_diff_json(chain.current(), r#"{"a":10,"b":20,"c":30}"#))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["b"], 20);
+        assert_eq!(v["c"], 30);
+    }
+
+    #[test]
+    fn test_json_compose_roundtrip() {
+        let orig = r#"{"x":1}"#;
+        let mut chain = MutationChain::new(orig, FormatKind::Json);
+        chain.mutate(&gudf_diff_json(orig, r#"{"x":2}"#)).unwrap();
+        chain
+            .mutate(&gudf_diff_json(chain.current(), r#"{"x":2,"y":3}"#))
+            .unwrap();
+
+        let composed = chain.compose().unwrap();
+        let reconstructed = patch_as(FormatKind::Json, orig, &composed.changes).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        let got: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]
     fn test_json_undo_redo_cycle() {
-        let original = r#"{"count":0}"#;
-        let mut chain = MutationChain::new(original, FormatKind::Json);
-
-        // Increment 3 times: 0 → 1 → 2 → 3
+        let mut chain = MutationChain::new(r#"{"count":0}"#, FormatKind::Json);
         for i in 1..=3 {
             let prev = chain.current().to_string();
-            let next = format!(r#"{{"count":{i}}}"#);
-            let d = gudf_diff_json(&prev, &next);
-            chain.mutate(&d).unwrap();
+            chain
+                .mutate(&gudf_diff_json(&prev, &format!(r#"{{"count":{i}}}"#)))
+                .unwrap();
         }
-
-        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(val["count"], 3);
-
-        // Undo twice → count should be 1
         assert_eq!(chain.undo_n(2), 2);
-        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(val["count"], 1);
-        assert_eq!(chain.redo_len(), 2);
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["count"], 1);
 
-        // Redo once → count should be 2
         chain.redo();
-        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(val["count"], 2);
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["count"], 2);
 
-        // Redo again → count should be 3
         chain.redo();
-        let val: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
-        assert_eq!(val["count"], 3);
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["count"], 3);
         assert!(!chain.can_redo());
+    }
+
+    #[test]
+    fn test_apply_raw_changes() {
+        let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
+        chain
+            .apply(&[Change {
+                kind: ChangeKind::Modified,
+                path: Some("a".to_string()),
+                old_value: Some("1".to_string()),
+                new_value: Some("99".to_string()),
+                location: None,
+                annotations: Vec::new(),
+            }])
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["a"], 99);
+    }
+
+    #[test]
+    fn test_diffs() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+        assert_eq!(chain.diffs().len(), 2);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

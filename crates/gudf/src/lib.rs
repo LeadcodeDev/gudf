@@ -20,7 +20,7 @@ pub use error::GudfError;
 pub use format::{detect_format, Format, FormatKind};
 pub use formats::cross::{diff_cross, CrossFormatKind};
 pub use merge::{merge, merge_json, Conflict, MergeResult, MergeStrategy};
-pub use mutation::{MutationChain, MutationState};
+pub use mutation::{ContentSha, LogEntry, MutationChain, MutationState};
 pub use output::OutputFormatter;
 pub use patch::Patchable;
 pub use pipeline::DiffPipeline;

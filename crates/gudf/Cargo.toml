@@ -12,6 +12,7 @@ toml = "0.8"
 serde_yaml = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+sha1 = "0.10"
 
 # Tree-sitter core
 tree-sitter = "0.24"
