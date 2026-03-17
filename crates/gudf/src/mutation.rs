@@ -1,10 +1,14 @@
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use sha1::{Digest, Sha1};
 
 use crate::engine::DiffEngine;
 use crate::error::GudfError;
 use crate::format::FormatKind;
+use crate::output::unified::UnifiedFormatter;
+use crate::output::OutputFormatter;
 use crate::patch::patch_as;
 use crate::result::{Change, ChangeKind, DiffResult, DiffStats};
 
@@ -286,6 +290,120 @@ impl MutationChain {
         entries
     }
 
+    // ── Expressions ─────────────────────────────────────────────────────
+
+    /// Resolve a git-like expression to a `(step, document)` pair.
+    ///
+    /// Supported expressions:
+    /// - `HEAD`            — current state
+    /// - `HEAD~N`          — N steps back from HEAD
+    /// - `HEAD^`           — parent of HEAD (same as `HEAD~1`)
+    /// - `HEAD^^`          — grandparent (same as `HEAD~2`)
+    /// - `ORIG`            — the original document (step 0)
+    /// - `@N`              — step N directly (e.g. `@0`, `@3`)
+    /// - `<sha-prefix>`    — lookup by full or short SHA
+    pub fn resolve(&self, expr: &str) -> Option<(usize, &str)> {
+        let expr = expr.trim();
+
+        // ORIG
+        if expr.eq_ignore_ascii_case("ORIG") {
+            return Some((0, &self.original));
+        }
+
+        // @N — direct step index
+        if let Some(rest) = expr.strip_prefix('@') {
+            if let Ok(step) = rest.parse::<usize>() {
+                return self.at(step).map(|doc| (step, doc));
+            }
+        }
+
+        // HEAD variants
+        if expr.eq_ignore_ascii_case("HEAD") {
+            let step = self.states.len();
+            return Some((step, self.current()));
+        }
+
+        if let Some(head_expr) = expr
+            .strip_prefix("HEAD")
+            .or_else(|| expr.strip_prefix("head"))
+        {
+            // HEAD~N
+            if let Some(rest) = head_expr.strip_prefix('~') {
+                let n: usize = rest.parse().ok()?;
+                let current_step = self.states.len();
+                let target = current_step.checked_sub(n)?;
+                return self.at(target).map(|doc| (target, doc));
+            }
+
+            // HEAD^^^... — count carets
+            if head_expr.starts_with('^') && head_expr.chars().all(|c| c == '^') {
+                let n = head_expr.len();
+                let current_step = self.states.len();
+                let target = current_step.checked_sub(n)?;
+                return self.at(target).map(|doc| (target, doc));
+            }
+        }
+
+        // Fall through: try as SHA prefix
+        self.find_by_sha(expr)
+    }
+
+    /// Resolve an expression and return the document content, or an error.
+    pub fn resolve_or_err(&self, expr: &str) -> Result<(usize, &str), GudfError> {
+        self.resolve(expr).ok_or_else(|| {
+            GudfError::PatchError(format!("Cannot resolve expression: '{expr}'"))
+        })
+    }
+
+    /// Compose the diff between two expressions.
+    ///
+    /// ```rust,ignore
+    /// let diff = chain.diff_expr("HEAD~3", "HEAD")?;
+    /// let diff = chain.diff_expr("ORIG", "HEAD~1")?;
+    /// let diff = chain.diff_expr("@1", "@3")?;
+    /// ```
+    pub fn diff_expr(&self, from: &str, to: &str) -> Result<DiffResult, GudfError> {
+        let (from_step, _) = self.resolve_or_err(from)?;
+        let (to_step, _) = self.resolve_or_err(to)?;
+        self.compose_range(from_step, to_step)
+    }
+
+    // ── File I/O ──────────────────────────────────────────────────────
+
+    /// Create a chain from a file. Format is auto-detected from extension.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, GudfError> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(GudfError::Io)?;
+        let format = format_from_extension(path);
+        Ok(Self::new(content, format))
+    }
+
+    /// Create a chain from a file with an explicit format.
+    pub fn from_file_as(path: impl AsRef<Path>, format: FormatKind) -> Result<Self, GudfError> {
+        let content = fs::read_to_string(path).map_err(GudfError::Io)?;
+        Ok(Self::new(content, format))
+    }
+
+    /// Write the current state to a file.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), GudfError> {
+        fs::write(path, self.current()).map_err(GudfError::Io)
+    }
+
+    /// Write the state at a given expression to a file.
+    pub fn save_expr(&self, expr: &str, path: impl AsRef<Path>) -> Result<(), GudfError> {
+        let (_, doc) = self.resolve_or_err(expr)?;
+        fs::write(path, doc).map_err(GudfError::Io)
+    }
+
+    /// Read a file, diff it against the current state, and apply the diff as
+    /// the next mutation. Returns the new document content.
+    pub fn mutate_file(&mut self, path: impl AsRef<Path>) -> Result<&str, GudfError> {
+        let new_content = fs::read_to_string(path).map_err(GudfError::Io)?;
+        let engine = DiffEngine::new();
+        let diff = engine.diff_as(self.format.clone(), self.current(), &new_content)?;
+        self.mutate(&diff)
+    }
+
     // ── Undo / Redo ────────────────────────────────────────────────────
 
     /// Undo the last mutation, pushing it onto the redo stack.
@@ -413,6 +531,34 @@ impl MutationChain {
         Ok(&self.states[0].diff)
     }
 
+    // ── Expression-based formatting ───────────────────────────────────
+
+    /// Start building a unified diff between two expressions.
+    ///
+    /// ```rust,ignore
+    /// let output = chain.unified("HEAD~1", "HEAD")
+    ///     .context(5)
+    ///     .render()?;
+    /// ```
+    pub fn unified<'a>(&'a self, from: &str, to: &str) -> ExprDiffBuilder<'a> {
+        ExprDiffBuilder::new(self, from, to)
+    }
+
+    /// Render a diff between two expressions with any `OutputFormatter`.
+    ///
+    /// ```rust,ignore
+    /// let output = chain.format_expr("ORIG", "HEAD", &InlineFormatter)?;
+    /// ```
+    pub fn format_expr(
+        &self,
+        from: &str,
+        to: &str,
+        formatter: &dyn OutputFormatter,
+    ) -> Result<String, GudfError> {
+        let diff = self.diff_expr(from, to)?;
+        Ok(formatter.format(&diff))
+    }
+
     /// Cumulative stats across all mutations.
     pub fn total_stats(&self) -> DiffStats {
         let mut total = DiffStats {
@@ -433,7 +579,94 @@ impl MutationChain {
     }
 }
 
+// ── ExprDiffBuilder ───────────────────────────────────────────────────
+
+/// Builder for creating formatted diffs between two expressions.
+///
+/// Created via [`MutationChain::unified`]. Resolves expressions, computes
+/// the diff, and renders with configurable context lines.
+///
+/// ```rust,ignore
+/// let output = chain.unified("ORIG", "HEAD")
+///     .context(5)
+///     .render()?;
+///
+/// // Use a custom formatter instead of unified:
+/// let output = chain.unified("HEAD~2", "HEAD")
+///     .render_with(&InlineFormatter)?;
+/// ```
+pub struct ExprDiffBuilder<'a> {
+    chain: &'a MutationChain,
+    from: String,
+    to: String,
+    context_lines: usize,
+}
+
+impl<'a> ExprDiffBuilder<'a> {
+    fn new(chain: &'a MutationChain, from: &str, to: &str) -> Self {
+        Self {
+            chain,
+            from: from.to_string(),
+            to: to.to_string(),
+            context_lines: 3,
+        }
+    }
+
+    /// Set the number of context lines (default: 3).
+    pub fn context(mut self, lines: usize) -> Self {
+        self.context_lines = lines;
+        self
+    }
+
+    /// Resolve expressions and compute the diff.
+    pub fn diff(&self) -> Result<DiffResult, GudfError> {
+        self.chain.diff_expr(&self.from, &self.to)
+    }
+
+    /// Render the diff as a unified format string.
+    pub fn render(&self) -> Result<String, GudfError> {
+        let diff = self.diff()?;
+        let from_label = self.label(&self.from);
+        let to_label = self.label(&self.to);
+        let formatter = UnifiedFormatter::new(from_label, to_label).context(self.context_lines);
+        Ok(formatter.format(&diff))
+    }
+
+    /// Render with a custom `OutputFormatter`.
+    pub fn render_with(&self, formatter: &dyn OutputFormatter) -> Result<String, GudfError> {
+        let diff = self.diff()?;
+        Ok(formatter.format(&diff))
+    }
+
+    /// Build a label for the `---`/`+++` header from an expression.
+    /// Appends the short-sha for context.
+    fn label(&self, expr: &str) -> String {
+        if let Some((step, _)) = self.chain.resolve(expr) {
+            if let Some(sha) = self.chain.sha_at(step) {
+                return format!("{expr} ({})", sha.short());
+            }
+        }
+        expr.to_string()
+    }
+}
+
 // ── Internal helpers ───────────────────────────────────────────────────
+
+/// Detect format from file extension.
+fn format_from_extension(path: &Path) -> FormatKind {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "json" => FormatKind::Json,
+        "toml" => FormatKind::Toml,
+        "yaml" | "yml" => FormatKind::Yaml,
+        _ => FormatKind::Text,
+    }
+}
 
 fn apply_diff(base: &str, format: &FormatKind, diff: &DiffResult) -> Result<String, GudfError> {
     match format {
@@ -881,6 +1114,354 @@ mod tests {
         chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
         chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
         assert_eq!(chain.diffs().len(), 2);
+    }
+
+    // ── Expressions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_head() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+
+        let (step, doc) = chain.resolve("HEAD").unwrap();
+        assert_eq!(step, 2);
+        assert_eq!(doc, "c\n");
+    }
+
+    #[test]
+    fn test_resolve_head_tilde() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+        chain.mutate(&gudf_diff_text("c\n", "d\n")).unwrap();
+
+        let (step, doc) = chain.resolve("HEAD~1").unwrap();
+        assert_eq!(step, 2);
+        assert_eq!(doc, "c\n");
+
+        let (step, doc) = chain.resolve("HEAD~3").unwrap();
+        assert_eq!(step, 0);
+        assert_eq!(doc, "a\n");
+
+        // Out of range
+        assert!(chain.resolve("HEAD~99").is_none());
+    }
+
+    #[test]
+    fn test_resolve_head_caret() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+
+        let (step, doc) = chain.resolve("HEAD^").unwrap();
+        assert_eq!(step, 1);
+        assert_eq!(doc, "b\n");
+
+        let (step, doc) = chain.resolve("HEAD^^").unwrap();
+        assert_eq!(step, 0);
+        assert_eq!(doc, "a\n");
+    }
+
+    #[test]
+    fn test_resolve_orig() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let (step, doc) = chain.resolve("ORIG").unwrap();
+        assert_eq!(step, 0);
+        assert_eq!(doc, "a\n");
+    }
+
+    #[test]
+    fn test_resolve_at_step() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+
+        let (step, doc) = chain.resolve("@0").unwrap();
+        assert_eq!(step, 0);
+        assert_eq!(doc, "a\n");
+
+        let (step, doc) = chain.resolve("@2").unwrap();
+        assert_eq!(step, 2);
+        assert_eq!(doc, "c\n");
+
+        assert!(chain.resolve("@99").is_none());
+    }
+
+    #[test]
+    fn test_resolve_sha() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let sha = chain.sha_at(1).unwrap().short();
+        let (step, doc) = chain.resolve(&sha).unwrap();
+        assert_eq!(step, 1);
+        assert_eq!(doc, "b\n");
+    }
+
+    #[test]
+    fn test_resolve_not_found() {
+        let chain = MutationChain::new("a\n", FormatKind::Text);
+        assert!(chain.resolve("NOPE").is_none());
+        assert!(chain.resolve("@999").is_none());
+        assert!(chain.resolve("HEAD~1").is_none()); // no mutations
+    }
+
+    #[test]
+    fn test_resolve_or_err() {
+        let chain = MutationChain::new("a\n", FormatKind::Text);
+        assert!(chain.resolve_or_err("HEAD").is_ok());
+        assert!(chain.resolve_or_err("NOPE").is_err());
+    }
+
+    #[test]
+    fn test_diff_expr() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+        chain.mutate(&gudf_diff_text("c\n", "d\n")).unwrap();
+
+        // ORIG → HEAD
+        let diff = chain.diff_expr("ORIG", "HEAD").unwrap();
+        assert!(diff.stats.additions > 0 || diff.stats.deletions > 0);
+
+        // HEAD~2 → HEAD
+        let diff = chain.diff_expr("HEAD~2", "HEAD").unwrap();
+        assert!(diff.stats.additions > 0 || diff.stats.deletions > 0);
+
+        // @1 → @2
+        let diff = chain.diff_expr("@1", "@2").unwrap();
+        assert!(diff.stats.additions > 0 || diff.stats.deletions > 0);
+    }
+
+    // ── ExprDiffBuilder ────────────────────────────────────────────────
+
+    #[test]
+    fn test_unified_builder_render() {
+        let mut chain = MutationChain::new("a\nb\nc\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\nb\nc\n", "a\nx\nc\n")).unwrap();
+
+        let output = chain.unified("ORIG", "HEAD").render().unwrap();
+        assert!(output.contains("@@"));
+        assert!(output.contains("-b"));
+        assert!(output.contains("+x"));
+        // Headers contain expression + short-sha
+        assert!(output.contains("ORIG"));
+        assert!(output.contains("HEAD"));
+    }
+
+    #[test]
+    fn test_unified_builder_context() {
+        let mut chain = MutationChain::new(
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+            FormatKind::Text,
+        );
+        chain
+            .mutate(&gudf_diff_text(
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+                "1\n2\n3\n4\nX\n6\n7\n8\n9\n10\n",
+            ))
+            .unwrap();
+
+        let narrow = chain.unified("ORIG", "HEAD").context(1).render().unwrap();
+        let wide = chain.unified("ORIG", "HEAD").context(5).render().unwrap();
+        // More context = more lines
+        assert!(wide.len() > narrow.len());
+    }
+
+    #[test]
+    fn test_unified_builder_with_tilde() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+        chain.mutate(&gudf_diff_text("c\n", "d\n")).unwrap();
+
+        // Diff from step 1 to step 3
+        let output = chain.unified("HEAD~2", "HEAD").render().unwrap();
+        assert!(output.contains("@@"));
+        assert!(output.contains("-b"));
+        assert!(output.contains("+d"));
+    }
+
+    #[test]
+    fn test_unified_builder_sha_in_header() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let output = chain.unified("ORIG", "HEAD").render().unwrap();
+        let orig_short = chain.original_sha().short();
+        let head_short = chain.current_sha().short();
+        assert!(output.contains(&orig_short));
+        assert!(output.contains(&head_short));
+    }
+
+    #[test]
+    fn test_unified_builder_diff() {
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let diff = chain.unified("ORIG", "HEAD").diff().unwrap();
+        assert!(diff.stats.additions > 0 || diff.stats.deletions > 0);
+    }
+
+    #[test]
+    fn test_unified_builder_render_with() {
+        use crate::output::inline::InlineFormatter;
+
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let output = chain
+            .unified("ORIG", "HEAD")
+            .render_with(&InlineFormatter)
+            .unwrap();
+        assert!(output.contains("[-]"));
+        assert!(output.contains("[+]"));
+    }
+
+    #[test]
+    fn test_format_expr() {
+        use crate::output::inline::InlineFormatter;
+
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+
+        let output = chain.format_expr("ORIG", "HEAD", &InlineFormatter).unwrap();
+        assert!(output.contains("[-]"));
+        assert!(output.contains("[+]"));
+    }
+
+    #[test]
+    fn test_unified_builder_json() {
+        let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
+        chain
+            .mutate(&gudf_diff_json(r#"{"a":1}"#, r#"{"a":2,"b":3}"#))
+            .unwrap();
+
+        let output = chain.unified("ORIG", "HEAD").render().unwrap();
+        assert!(output.contains("@@"));
+    }
+
+    // ── File I/O ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.json");
+        fs::write(&path, r#"{"a": 1}"#).unwrap();
+
+        let chain = MutationChain::from_file(&path).unwrap();
+        assert_eq!(chain.current(), r#"{"a": 1}"#);
+        assert_eq!(chain.format, FormatKind::Json);
+    }
+
+    #[test]
+    fn test_from_file_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello\n").unwrap();
+
+        let chain = MutationChain::from_file(&path).unwrap();
+        assert_eq!(chain.format, FormatKind::Text);
+    }
+
+    #[test]
+    fn test_from_file_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "name: test\n").unwrap();
+
+        let chain = MutationChain::from_file(&path).unwrap();
+        assert_eq!(chain.format, FormatKind::Yaml);
+    }
+
+    #[test]
+    fn test_from_file_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        fs::write(&path, r#"{"a": 1}"#).unwrap();
+
+        let chain = MutationChain::from_file_as(&path, FormatKind::Json).unwrap();
+        assert_eq!(chain.format, FormatKind::Json);
+    }
+
+    #[test]
+    fn test_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+
+        let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
+        chain
+            .mutate(&gudf_diff_json(r#"{"a":1}"#, r#"{"a":2}"#))
+            .unwrap();
+
+        chain.save(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["a"], 2);
+    }
+
+    #[test]
+    fn test_save_expr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+
+        let mut chain = MutationChain::new("a\n", FormatKind::Text);
+        chain.mutate(&gudf_diff_text("a\n", "b\n")).unwrap();
+        chain.mutate(&gudf_diff_text("b\n", "c\n")).unwrap();
+
+        // Save step 1 (not current)
+        chain.save_expr("@1", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "b\n");
+
+        // Save HEAD^
+        chain.save_expr("HEAD^", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn test_mutate_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("next.json");
+
+        let mut chain = MutationChain::new(r#"{"a":1}"#, FormatKind::Json);
+        fs::write(&path, r#"{"a":2,"b":3}"#).unwrap();
+
+        chain.mutate_file(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(chain.current()).unwrap();
+        assert_eq!(v["a"], 2);
+        assert_eq!(v["b"], 3);
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn test_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.json");
+        let v1 = dir.path().join("v1.json");
+        let v2 = dir.path().join("v2.json");
+
+        fs::write(&src, r#"{"x":1}"#).unwrap();
+        fs::write(&v1, r#"{"x":2}"#).unwrap();
+        fs::write(&v2, r#"{"x":2,"y":3}"#).unwrap();
+
+        let mut chain = MutationChain::from_file(&src).unwrap();
+        chain.mutate_file(&v1).unwrap();
+        chain.mutate_file(&v2).unwrap();
+
+        let out = dir.path().join("out.json");
+        chain.save(&out).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(result["x"], 2);
+        assert_eq!(result["y"], 3);
+
+        // Save original via expression
+        let orig_out = dir.path().join("orig.json");
+        chain.save_expr("ORIG", &orig_out).unwrap();
+        assert_eq!(fs::read_to_string(&orig_out).unwrap(), r#"{"x":1}"#);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

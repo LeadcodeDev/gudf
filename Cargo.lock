@@ -310,6 +310,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "similar",
+ "tempfile",
  "thiserror",
  "toml",
  "tree-sitter",

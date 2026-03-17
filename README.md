@@ -323,32 +323,23 @@ Reconstruct a document through a sequence of diffs, with full history tracking, 
 
 Every state (including the original) is identified by a `ContentSha` — a SHA-1 hash of its content, like git blob objects. States can be looked up by full sha, short sha (7 chars), or any unambiguous prefix.
 
+#### SHA-based identification
+
 ```rust
 use gudf::{MutationChain, ContentSha, FormatKind};
 
 let mut chain = MutationChain::new(r#"{"version": 1}"#, FormatKind::Json);
 
-// Each state has a SHA
 println!("original: {}", chain.original_sha());       // e.g. "a3f1c2d"
 println!("full:     {}", chain.original_sha().full()); // 40-char hex
 
-// Apply mutations — SHA updates automatically
-let diff1 = gudf::diff_json(r#"{"version": 1}"#, r#"{"version": 2}"#)?;
-chain.mutate(&diff1)?;
-println!("current:  {}", chain.current_sha()); // different sha
-
-let diff2 = gudf::diff_json(chain.current(), r#"{"version": 2, "name": "gudf"}"#)?;
-chain.mutate(&diff2)?;
+chain.mutate(&diff)?;
+println!("current:  {}", chain.current_sha());
 
 // Look up state by SHA prefix
 let (step, doc) = chain.find_by_sha("a3f1").unwrap();
-
-// SHA at any step
 let sha = chain.sha_at(1).unwrap();
-println!("{} → {}", sha.short(), sha.full());
-
-// All SHAs in order
-let shas = chain.shas(); // [original_sha, sha_1, sha_2]
+let all_shas = chain.shas();
 
 // Git-log-style summary
 for entry in chain.log() {
@@ -357,52 +348,98 @@ for entry in chain.log() {
         Some(s) => println!("{} +{} -{} ~{}", entry.sha, s.additions, s.deletions, s.modifications),
     }
 }
+```
 
-// Undo / Redo — SHA is preserved through the cycle
-chain.undo();
-chain.redo();
+#### Git-like expressions
 
-chain.undo_n(2);
-chain.redo_all();
+Navigate the chain with expressions instead of step indices:
 
-// New mutation after undo forks history (clears redo stack)
-chain.undo();
-chain.mutate(&some_diff)?;
-assert!(!chain.can_redo());
+```rust
+// Resolve any expression to (step, document)
+let (step, doc) = chain.resolve("HEAD").unwrap();
+let (step, doc) = chain.resolve("HEAD~2").unwrap();   // 2 steps back
+let (step, doc) = chain.resolve("HEAD^^").unwrap();    // grandparent
+let (step, doc) = chain.resolve("ORIG").unwrap();      // step 0
+let (step, doc) = chain.resolve("@3").unwrap();        // step 3 directly
+let (step, doc) = chain.resolve("a3f1c2d").unwrap();   // by SHA prefix
 
-// Rewind to step (undone states go to redo stack)
-chain.rewind(1);
-chain.redo_all();
+// Diff between two expressions
+let diff = chain.diff_expr("ORIG", "HEAD")?;
+let diff = chain.diff_expr("HEAD~3", "HEAD")?;
+let diff = chain.diff_expr("@1", "@3")?;
 
-// Compose / squash
-let composed = chain.compose()?;
-let partial = chain.compose_range(1, 3)?;
-chain.squash()?;
+// Save a specific expression to disk
+chain.save_expr("HEAD~1", "previous.json")?;
+```
+
+| Expression    | Resolves to                          |
+| ------------- | ------------------------------------ |
+| `HEAD`        | Current state                        |
+| `HEAD~N`      | N steps back from HEAD               |
+| `HEAD^`       | Parent of HEAD (= `HEAD~1`)          |
+| `HEAD^^`      | Grandparent (= `HEAD~2`)            |
+| `ORIG`        | Original document (step 0)           |
+| `@N`          | Step N directly                      |
+| `<sha>`       | Lookup by full or short SHA prefix   |
+
+#### File I/O
+
+Load from files, apply file mutations, and save states to disk:
+
+```rust
+use gudf::MutationChain;
+
+// Create chain from file (format auto-detected from extension)
+let mut chain = MutationChain::from_file("config.json")?;
+// or with explicit format:
+let mut chain = MutationChain::from_file_as("data", FormatKind::Json)?;
+
+// Apply a file as the next mutation (diffs against current, then applies)
+chain.mutate_file("config_v2.json")?;
+chain.mutate_file("config_v3.json")?;
+
+// Save current state
+chain.save("output.json")?;
+
+// Save any expression to a file
+chain.save_expr("ORIG", "original.json")?;
+chain.save_expr("HEAD~1", "previous.json")?;
+```
+
+#### Undo / redo / compose
+
+```rust
+chain.undo();                   // push to redo stack
+chain.redo();                   // pop from redo stack
+chain.undo_n(2);                // undo 2 at once
+chain.redo_all();               // redo everything
+
+chain.rewind(1);                // undo to step 1 (redoable)
+
+chain.mutate(&diff)?;           // forks: clears redo stack
+
+let composed = chain.compose()?;         // original → current
+let range = chain.compose_range(1, 3)?;  // step 1 → step 3
+chain.squash()?;                         // collapse to single mutation
 ```
 
 Key capabilities:
 
-| Method                       | Description                                            |
-| ---------------------------- | ------------------------------------------------------ |
-| `mutate(diff)`               | Apply a `DiffResult` as the next mutation              |
-| `apply(changes)`             | Apply raw `Change` slice as a mutation                 |
-| `current()` / `current_sha()`| Document content and SHA after all mutations           |
-| `original()` / `original_sha()` | Original document content and SHA                  |
-| `at(step)` / `sha_at(step)` | Document or SHA at step N (0 = original)               |
-| `find_by_sha(prefix)`        | Look up `(step, doc)` by full or short SHA prefix      |
-| `shas()`                     | All SHAs from original through current                 |
-| `log()`                      | Git-log-style `Vec<LogEntry>` with step, sha, stats    |
-| `history()`                  | All document states as strings                         |
-| `undo()` / `redo()`          | Single undo/redo (SHA preserved)                       |
-| `undo_n(n)` / `redo_n(n)`    | Batch undo/redo                                        |
-| `redo_all()`                 | Redo all undone mutations                              |
-| `can_undo()` / `can_redo()`  | Check if undo/redo is available                        |
-| `rewind(step)`               | Undo to step N (undone states go to redo stack)        |
-| `compose()`                  | Single diff from original to current                   |
-| `compose_range(from, to)`    | Single diff between two steps                          |
-| `squash()`                   | Collapse all mutations into one (clears redo)          |
-| `total_stats()`              | Cumulative stats across all mutations                  |
-| `diffs()`                 | All applied `DiffResult`s in order                      |
+| Method                           | Description                                         |
+| -------------------------------- | --------------------------------------------------- |
+| `mutate(diff)` / `apply(changes)`| Apply diff or raw changes as next mutation           |
+| `mutate_file(path)`              | Read file, diff against current, apply               |
+| `from_file(path)`                | Create chain from file (auto-detect format)          |
+| `save(path)` / `save_expr(e, p)` | Write current or expression state to file           |
+| `resolve(expr)`                  | Resolve expression to `(step, doc)`                  |
+| `diff_expr(from, to)`            | Diff between two expressions                         |
+| `current_sha()` / `sha_at(step)` | SHA of current or any step                          |
+| `find_by_sha(prefix)`            | Lookup by SHA prefix                                 |
+| `log()`                          | Git-log-style `Vec<LogEntry>`                        |
+| `undo()` / `redo()`              | Single undo/redo                                     |
+| `undo_n(n)` / `redo_n(n)` / `redo_all()` | Batch undo/redo                             |
+| `compose()` / `compose_range()`  | Compose diffs across steps                           |
+| `squash()`                       | Collapse all mutations into one                      |
 
 ## Supported Formats
 
