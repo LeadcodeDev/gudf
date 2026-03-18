@@ -1,3 +1,4 @@
+use crate::path::{self, PathSegment};
 use crate::result::{Change, ChangeKind, DiffResult};
 
 /// A composable pipeline for filtering and querying diff changes.
@@ -119,9 +120,18 @@ impl PathMatcher {
         Self { segments }
     }
 
-    pub fn matches(&self, path: &str) -> bool {
-        let parts: Vec<&str> = path.split('.').collect();
-        self.match_recursive(&self.segments, &parts)
+    pub fn matches(&self, input_path: &str) -> bool {
+        // Use the shared path parser to decompose the path into string segments
+        let parsed = path::parse_path(input_path);
+        let parts: Vec<String> = parsed
+            .iter()
+            .map(|seg| match seg {
+                PathSegment::Key(k) => k.clone(),
+                PathSegment::Index(i) => i.to_string(),
+            })
+            .collect();
+        let part_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+        self.match_recursive(&self.segments, &part_refs)
     }
 
     fn match_recursive(&self, segments: &[PatternSegment], parts: &[&str]) -> bool {

@@ -60,6 +60,16 @@ impl DiffEngine {
 
     pub fn diff(&self, old: &str, new: &str) -> Result<DiffResult, GudfError> {
         let kind = detect_format(old);
+        let kind = if kind == FormatKind::Text && !new.is_empty() {
+            let new_kind = detect_format(new);
+            if new_kind != FormatKind::Text {
+                new_kind
+            } else {
+                kind
+            }
+        } else {
+            kind
+        };
         self.diff_as(kind, old, new)
     }
 
@@ -163,7 +173,7 @@ mod tests {
     #[test]
     fn test_with_annotators() {
         let engine = DiffEngine::new()
-            .with_annotators(vec![Box::new(SensitiveFieldAnnotator)]);
+            .with_annotators(vec![Box::new(SensitiveFieldAnnotator::default())]);
         let result = engine
             .diff(
                 r#"{"password": "old"}"#,
@@ -176,6 +186,22 @@ mod tests {
             .find(|c| c.kind == ChangeKind::Modified)
             .unwrap();
         assert!(!modified.annotations.is_empty());
+    }
+
+    #[test]
+    fn test_detect_fallback_to_new_content() {
+        // When old is empty JSON object and new is JSON, engine should detect JSON
+        let engine = DiffEngine::new();
+        let result = engine.diff("{}", r#"{"a": 1}"#).unwrap();
+        assert_eq!(result.format, FormatKind::Json);
+
+        // Verify the fallback mechanism: when old is ambiguous text but new is YAML
+        let engine2 = DiffEngine::new();
+        let result2 = engine2
+            .diff("", "key: value\nother: data\n")
+            .unwrap();
+        // Old is empty text, new is YAML — should detect as YAML from new
+        assert_eq!(result2.format, FormatKind::Yaml);
     }
 
     #[test]

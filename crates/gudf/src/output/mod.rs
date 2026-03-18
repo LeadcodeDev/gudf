@@ -1,4 +1,5 @@
 pub mod inline;
+pub mod json;
 pub mod json_patch;
 pub mod unified;
 

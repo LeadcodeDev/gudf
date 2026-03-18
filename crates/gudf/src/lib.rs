@@ -1,4 +1,5 @@
 pub mod annotations;
+pub mod builder;
 pub mod engine;
 pub mod error;
 pub mod format;
@@ -7,6 +8,7 @@ pub mod merge;
 pub mod mutation;
 pub mod output;
 pub mod patch;
+pub mod path;
 pub mod pipeline;
 pub mod result;
 pub mod semantic;
@@ -26,6 +28,7 @@ pub use patch::Patchable;
 pub use pipeline::DiffPipeline;
 pub use result::{Change, ChangeKind, DiffResult, DiffStats, Location};
 pub use semantic::{SemanticAnalyzer, SemanticOptions};
+pub use builder::{Gudf, OutputKind};
 
 use formats::code::CodeFormat;
 use formats::json::JsonFormat;

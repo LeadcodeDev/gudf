@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::GudfError;
 use crate::format::FormatKind;
 use crate::formats::json::diff_values;
+use crate::path::{self, PathSegment};
 use crate::result::{Change, ChangeKind};
 
 /// The result of a three-way merge.
@@ -202,52 +203,105 @@ fn apply_change(root: &mut serde_json::Value, change: &Change) {
     }
 }
 
-fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) {
-    let parts: Vec<&str> = path.split('.').collect();
+fn set_path(root: &mut serde_json::Value, path_str: &str, value: serde_json::Value) {
+    let parts = path::parse_path(path_str);
     let mut current = root;
 
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
-            if let serde_json::Value::Object(map) = current {
-                map.insert(part.to_string(), value);
-                return;
-            }
-        } else {
-            if let serde_json::Value::Object(map) = current {
-                if !map.contains_key(*part) {
-                    map.insert(
-                        part.to_string(),
-                        serde_json::Value::Object(serde_json::Map::new()),
-                    );
+            match part {
+                PathSegment::Key(key) => {
+                    if let serde_json::Value::Object(map) = current {
+                        map.insert(key.clone(), value);
+                        return;
+                    }
                 }
-                current = map.get_mut(*part).unwrap();
-            } else {
-                return;
-            }
-        }
-    }
-}
-
-fn remove_path(root: &mut serde_json::Value, path: &str) {
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = root;
-
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            if let serde_json::Value::Object(map) = current {
-                map.remove(*part);
+                PathSegment::Index(idx) => {
+                    if let serde_json::Value::Array(arr) = current {
+                        if *idx < arr.len() {
+                            arr[*idx] = value;
+                            return;
+                        }
+                    }
+                }
             }
             return;
         }
-        current = match current {
-            serde_json::Value::Object(map) => {
-                if let Some(v) = map.get_mut(*part) {
-                    v
+
+        current = match part {
+            PathSegment::Key(key) => {
+                if let serde_json::Value::Object(map) = current {
+                    if !map.contains_key(key.as_str()) {
+                        map.insert(
+                            key.clone(),
+                            serde_json::Value::Object(serde_json::Map::new()),
+                        );
+                    }
+                    map.get_mut(key.as_str()).unwrap()
                 } else {
                     return;
                 }
             }
-            _ => return,
+            PathSegment::Index(idx) => {
+                if let serde_json::Value::Array(arr) = current {
+                    if let Some(v) = arr.get_mut(*idx) {
+                        v
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        };
+    }
+}
+
+fn remove_path(root: &mut serde_json::Value, path_str: &str) {
+    let parts = path::parse_path(path_str);
+    let mut current = root;
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            match part {
+                PathSegment::Key(key) => {
+                    if let serde_json::Value::Object(map) = current {
+                        map.remove(key.as_str());
+                    }
+                }
+                PathSegment::Index(idx) => {
+                    if let serde_json::Value::Array(arr) = current {
+                        if *idx < arr.len() {
+                            arr.remove(*idx);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        current = match part {
+            PathSegment::Key(key) => {
+                if let serde_json::Value::Object(map) = current {
+                    if let Some(v) = map.get_mut(key.as_str()) {
+                        v
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+            PathSegment::Index(idx) => {
+                if let serde_json::Value::Array(arr) = current {
+                    if let Some(v) = arr.get_mut(*idx) {
+                        v
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
         };
     }
 }
@@ -366,5 +420,17 @@ mod tests {
         assert!(result.is_clean());
         assert_eq!(result.merged["config"]["port"], 8080);
         assert_eq!(result.merged["config"]["host"], "example.com");
+    }
+
+    #[test]
+    fn test_merge_with_arrays() {
+        let base = serde_json::json!({"items": [{"name": "a"}, {"name": "b"}]});
+        let left = serde_json::json!({"items": [{"name": "a"}, {"name": "c"}]});
+        let right = serde_json::json!({"items": [{"name": "a"}, {"name": "b"}]});
+
+        let result = merge_json(&base, &left, &right, MergeStrategy::Manual);
+
+        assert!(result.is_clean());
+        assert_eq!(result.merged["items"][1]["name"], "c");
     }
 }

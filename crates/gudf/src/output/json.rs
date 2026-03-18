@@ -1,22 +1,14 @@
 use crate::format::FormatKind;
 use crate::output::OutputFormatter;
-use crate::path::to_json_pointer;
 use crate::result::{ChangeKind, DiffResult};
 
-/// Outputs diff in JSON Patch format (RFC 6902).
-pub struct JsonPatchFormatter;
+/// Outputs diff as a JSON array using gudf's native dot-notation paths.
+///
+/// Unlike `JsonPatchFormatter` (RFC 6902 with JSON Pointer `/a/b/0`),
+/// this uses human-readable paths: `a.b[0]`.
+pub struct JsonFormatter;
 
-impl JsonPatchFormatter {
-    /// For text diffs, derive a line index from the location.
-    fn text_line(change: &crate::result::Change) -> usize {
-        change
-            .location
-            .as_ref()
-            .map(|loc| loc.line.saturating_sub(1))
-            .unwrap_or(0)
-    }
-
-    /// Parse a value as JSON, or fall back to wrapping it as a JSON string.
+impl JsonFormatter {
     fn parse_value(raw: Option<&str>) -> serde_json::Value {
         let Some(v) = raw else {
             return serde_json::Value::Null;
@@ -26,12 +18,15 @@ impl JsonPatchFormatter {
         })
     }
 
-    /// Coalesce consecutive text changes into block operations.
-    /// - Consecutive removes → single remove with line range path
-    /// - Consecutive adds → single add with joined value
-    /// - A remove block immediately followed by an add block at the same position → replace
+    fn text_line(change: &crate::result::Change) -> usize {
+        change
+            .location
+            .as_ref()
+            .map(|loc| loc.line.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
     fn format_text(&self, result: &DiffResult) -> Vec<serde_json::Value> {
-        // First, group consecutive non-Unchanged changes into blocks
         let changes: Vec<_> = result
             .changes
             .iter()
@@ -42,7 +37,6 @@ impl JsonPatchFormatter {
             return Vec::new();
         }
 
-        // Build raw blocks: consecutive runs of the same ChangeKind
         let mut blocks: Vec<TextBlock> = Vec::new();
 
         for change in &changes {
@@ -64,8 +58,7 @@ impl JsonPatchFormatter {
 
             let can_extend = blocks.last().map_or(false, |b| b.kind == change.kind);
             if can_extend {
-                let block = blocks.last_mut().unwrap();
-                block.lines.push(value);
+                blocks.last_mut().unwrap().lines.push(value);
             } else {
                 blocks.push(TextBlock {
                     kind: change.kind.clone(),
@@ -75,45 +68,62 @@ impl JsonPatchFormatter {
             }
         }
 
-        // Now merge remove+add blocks at the same position into replace
         let mut ops: Vec<serde_json::Value> = Vec::new();
         let mut i = 0;
         while i < blocks.len() {
             let block = &blocks[i];
 
             if block.kind == ChangeKind::Removed {
-                // Check if next block is an add at the same position → replace
                 if let Some(next) = blocks.get(i + 1) {
                     if next.kind == ChangeKind::Added {
-                        let path = format!("/{}", block.start_line);
-                        let old_text = block.lines.join("\n");
-                        let new_text = next.lines.join("\n");
-                        ops.push(serde_json::json!({
-                            "op": "replace",
-                            "path": path,
-                            "old": old_text,
-                            "value": new_text,
-                        }));
+                        let rm_count = block.lines.len();
+                        let add_count = next.lines.len();
+                        let paired = rm_count.min(add_count);
+
+                        // Emit replace for the paired portion
+                        if paired > 0 {
+                            ops.push(serde_json::json!({
+                                "op": "replace",
+                                "line": block.start_line,
+                                "value": {
+                                    "before": block.lines[..paired].join("\n"),
+                                    "after": next.lines[..paired].join("\n"),
+                                },
+                            }));
+                        }
+
+                        // Emit remaining removes (more removed than added)
+                        if rm_count > paired {
+                            ops.push(serde_json::json!({
+                                "op": "remove",
+                                "line": block.start_line + paired,
+                                "value": block.lines[paired..].join("\n"),
+                            }));
+                        }
+
+                        // Emit remaining adds (more added than removed)
+                        if add_count > paired {
+                            ops.push(serde_json::json!({
+                                "op": "add",
+                                "line": next.start_line + paired,
+                                "value": next.lines[paired..].join("\n"),
+                            }));
+                        }
+
                         i += 2;
                         continue;
                     }
                 }
-                // Standalone remove block
-                let path = format!("/{}", block.start_line);
-                let text = block.lines.join("\n");
                 ops.push(serde_json::json!({
                     "op": "remove",
-                    "path": path,
-                    "old": text,
+                    "line": block.start_line,
+                    "value": block.lines.join("\n"),
                 }));
             } else if block.kind == ChangeKind::Added {
-                // Standalone add block
-                let path = format!("/{}", block.start_line);
-                let text = block.lines.join("\n");
                 ops.push(serde_json::json!({
                     "op": "add",
-                    "path": path,
-                    "value": text,
+                    "line": block.start_line,
+                    "value": block.lines.join("\n"),
                 }));
             }
 
@@ -130,7 +140,7 @@ struct TextBlock {
     lines: Vec<String>,
 }
 
-impl OutputFormatter for JsonPatchFormatter {
+impl OutputFormatter for JsonFormatter {
     fn format(&self, result: &DiffResult) -> String {
         let is_text = matches!(result.format, FormatKind::Text | FormatKind::Code(_));
 
@@ -140,48 +150,45 @@ impl OutputFormatter for JsonPatchFormatter {
             let mut ops: Vec<serde_json::Value> = Vec::new();
 
             for change in &result.changes {
-                let raw_path = change.path.as_deref().unwrap_or("");
-                let json_path = to_json_pointer(raw_path);
+                let path = change.path.as_deref().unwrap_or("");
 
                 match change.kind {
                     ChangeKind::Added => {
-                        let value = Self::parse_value(change.new_value.as_deref());
                         ops.push(serde_json::json!({
                             "op": "add",
-                            "path": json_path,
-                            "value": value,
+                            "path": path,
+                            "value": Self::parse_value(change.new_value.as_deref()),
                         }));
                     }
                     ChangeKind::Removed => {
                         ops.push(serde_json::json!({
                             "op": "remove",
-                            "path": json_path,
+                            "path": path,
+                            "value": Self::parse_value(change.old_value.as_deref()),
                         }));
                     }
                     ChangeKind::Modified => {
-                        let value = Self::parse_value(change.new_value.as_deref());
                         ops.push(serde_json::json!({
                             "op": "replace",
-                            "path": json_path,
-                            "value": value,
+                            "path": path,
+                            "value": {
+                                "before": Self::parse_value(change.old_value.as_deref()),
+                                "after": Self::parse_value(change.new_value.as_deref()),
+                            },
                         }));
                     }
                     ChangeKind::Moved => {
-                        let new_path = change.new_value.as_deref().unwrap_or("");
-                        let new_json_path = to_json_pointer(new_path);
                         ops.push(serde_json::json!({
                             "op": "move",
-                            "from": json_path,
-                            "path": new_json_path,
+                            "from": path,
+                            "path": change.new_value.as_deref().unwrap_or(""),
                         }));
                     }
                     ChangeKind::Renamed => {
-                        let new_path = change.new_value.as_deref().unwrap_or("");
-                        let new_json_path = to_json_pointer(new_path);
                         ops.push(serde_json::json!({
-                            "op": "move",
-                            "from": json_path,
-                            "path": new_json_path,
+                            "op": "rename",
+                            "from": path,
+                            "path": change.new_value.as_deref().unwrap_or(""),
                         }));
                     }
                     ChangeKind::Unchanged => {}
@@ -203,20 +210,27 @@ mod tests {
     use crate::formats::text::TextFormat;
 
     #[test]
-    fn test_json_patch_output() {
+    fn test_json_output_dot_notation() {
         let format = JsonFormat;
         let result = format
             .diff(r#"{"a": 1}"#, r#"{"a": 2, "b": 3}"#)
             .unwrap();
-        let formatter = JsonPatchFormatter;
+        let formatter = JsonFormatter;
         let output = formatter.format(&result);
         let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert!(ops.iter().any(|op| op["op"] == "replace"));
-        assert!(ops.iter().any(|op| op["op"] == "add"));
+
+        let replace_op = ops.iter().find(|op| op["op"] == "replace").unwrap();
+        assert_eq!(replace_op["path"], "a");
+        assert_eq!(replace_op["value"]["before"], 1);
+        assert_eq!(replace_op["value"]["after"], 2);
+
+        let add_op = ops.iter().find(|op| op["op"] == "add").unwrap();
+        assert_eq!(add_op["path"], "b");
+        assert_eq!(add_op["value"], 3);
     }
 
     #[test]
-    fn test_json_patch_array_paths() {
+    fn test_json_output_nested() {
         let format = JsonFormat;
         let result = format
             .diff(
@@ -224,83 +238,57 @@ mod tests {
                 r#"{"items": [{"name": "a"}, {"name": "c"}]}"#,
             )
             .unwrap();
-        let formatter = JsonPatchFormatter;
+        let formatter = JsonFormatter;
         let output = formatter.format(&result);
         let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+
         let replace_op = ops.iter().find(|op| op["op"] == "replace").unwrap();
-        assert_eq!(replace_op["path"], "/items/1/name");
+        assert_eq!(replace_op["path"], "items[1].name");
+        assert_eq!(replace_op["value"]["before"], "b");
+        assert_eq!(replace_op["value"]["after"], "c");
     }
 
     #[test]
-    fn test_json_patch_text_single_replace() {
-        // "world" → "rust" should produce a single replace, not remove + add
+    fn test_json_output_text_coalesced() {
         let format = TextFormat;
         let result = format.diff("hello\nworld\n", "hello\nrust\n").unwrap();
-        let formatter = JsonPatchFormatter;
-        let output = formatter.format(&result);
-        let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-
-        assert_eq!(ops.len(), 1, "should coalesce into a single replace op");
-        assert_eq!(ops[0]["op"], "replace");
-        assert_eq!(ops[0]["old"], "world");
-        assert_eq!(ops[0]["value"], "rust");
-    }
-
-    #[test]
-    fn test_json_patch_text_multiline_replace() {
-        // Multiple consecutive changed lines → one replace block
-        let format = TextFormat;
-        let result = format
-            .diff("a\nb\nc\nd\n", "a\nX\nY\nd\n")
-            .unwrap();
-        let formatter = JsonPatchFormatter;
-        let output = formatter.format(&result);
-        let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-
-        assert_eq!(ops.len(), 1, "should coalesce into a single replace op");
-        assert_eq!(ops[0]["op"], "replace");
-        assert_eq!(ops[0]["old"], "b\nc");
-        assert_eq!(ops[0]["value"], "X\nY");
-    }
-
-    #[test]
-    fn test_json_patch_text_pure_add() {
-        let format = TextFormat;
-        let result = format.diff("a\n", "a\nb\nc\n").unwrap();
-        let formatter = JsonPatchFormatter;
+        let formatter = JsonFormatter;
         let output = formatter.format(&result);
         let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
 
         assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0]["op"], "add");
-        assert_eq!(ops[0]["value"], "b\nc");
+        assert_eq!(ops[0]["op"], "replace");
+        assert_eq!(ops[0]["value"]["before"], "world");
+        assert_eq!(ops[0]["value"]["after"], "rust");
     }
 
     #[test]
-    fn test_json_patch_text_pure_remove() {
-        let format = TextFormat;
-        let result = format.diff("a\nb\nc\n", "a\n").unwrap();
-        let formatter = JsonPatchFormatter;
-        let output = formatter.format(&result);
-        let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0]["op"], "remove");
-        assert_eq!(ops[0]["old"], "b\nc");
-    }
-
-    #[test]
-    fn test_json_patch_text_multiple_hunks() {
-        // Two separate change regions should produce two ops
-        let format = TextFormat;
+    fn test_json_output_remove() {
+        let format = JsonFormat;
         let result = format
-            .diff("a\nb\nc\nd\ne\n", "a\nX\nc\nd\nY\n")
+            .diff(r#"{"a": 1, "b": 2}"#, r#"{"a": 1}"#)
             .unwrap();
-        let formatter = JsonPatchFormatter;
+        let formatter = JsonFormatter;
         let output = formatter.format(&result);
         let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
 
-        assert_eq!(ops.len(), 2, "two separate hunks should produce two ops");
-        assert!(ops.iter().all(|op| op["op"] == "replace"));
+        let remove_op = ops.iter().find(|op| op["op"] == "remove").unwrap();
+        assert_eq!(remove_op["path"], "b");
+        assert_eq!(remove_op["value"], 2);
+    }
+
+    #[test]
+    fn test_json_output_add() {
+        let format = JsonFormat;
+        let result = format
+            .diff(r#"{"a": 1}"#, r#"{"a": 1, "b": 2}"#)
+            .unwrap();
+        let formatter = JsonFormatter;
+        let output = formatter.format(&result);
+        let ops: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+
+        let add_op = ops.iter().find(|op| op["op"] == "add").unwrap();
+        assert_eq!(add_op["path"], "b");
+        assert_eq!(add_op["value"], 2);
     }
 }

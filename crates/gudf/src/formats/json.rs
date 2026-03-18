@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::error::GudfError;
 use crate::format::{Format, FormatKind};
+use crate::path;
 use crate::result::{Change, ChangeKind, DiffResult, DiffStats};
 
 pub struct JsonFormat;
@@ -49,11 +50,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
     match (old, new) {
         (Value::Object(old_map), Value::Object(new_map)) => {
             for (key, old_val) in old_map {
-                let child_path = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{path}.{key}")
-                };
+                let child_path = path::append_key(&path, key);
                 match new_map.get(key) {
                     Some(new_val) => diff_values(old_val, new_val, child_path, changes),
                     None => changes.push(Change {
@@ -68,11 +65,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
             }
             for (key, new_val) in new_map {
                 if !old_map.contains_key(key) {
-                    let child_path = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
+                    let child_path = path::append_key(&path, key);
                     changes.push(Change {
                         kind: ChangeKind::Added,
                         path: Some(child_path),
@@ -87,11 +80,7 @@ pub(crate) fn diff_values(old: &Value, new: &Value, path: String, changes: &mut 
         (Value::Array(old_arr), Value::Array(new_arr)) => {
             let max_len = old_arr.len().max(new_arr.len());
             for i in 0..max_len {
-                let child_path = if path.is_empty() {
-                    format!("[{i}]")
-                } else {
-                    format!("{path}[{i}]")
-                };
+                let child_path = path::append_index(&path, i);
                 match (old_arr.get(i), new_arr.get(i)) {
                     (Some(old_val), Some(new_val)) => {
                         diff_values(old_val, new_val, child_path, changes);

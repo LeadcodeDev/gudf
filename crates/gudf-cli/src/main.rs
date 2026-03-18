@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 use gudf::output::inline::InlineFormatter;
+use gudf::output::json::JsonFormatter;
 use gudf::output::json_patch::JsonPatchFormatter;
 use gudf::output::unified::UnifiedFormatter;
 use gudf::output::OutputFormatter;
@@ -34,7 +35,7 @@ struct Cli {
     #[arg(short, long)]
     format: Option<String>,
 
-    /// Output format (unified, inline, json-patch)
+    /// Output format (unified, inline, json, json-patch)
     #[arg(short, long, default_value = "unified")]
     output: String,
 
@@ -102,7 +103,7 @@ enum Commands {
         #[arg(long)]
         save: Option<String>,
 
-        /// Output format (unified, inline, json-patch)
+        /// Output format (unified, inline, json, json-patch)
         #[arg(short, long, default_value = "unified")]
         output: String,
 
@@ -116,15 +117,18 @@ enum Commands {
     },
 }
 
-fn read_input(path: &str) -> Result<String, GudfError> {
-    if path == "-" {
+fn read_input(input: &str) -> Result<String, GudfError> {
+    if input == "-" {
         let mut buf = String::new();
         io::stdin()
             .read_to_string(&mut buf)
             .map_err(GudfError::Io)?;
         Ok(buf)
+    } else if Path::new(input).exists() {
+        fs::read_to_string(input).map_err(GudfError::Io)
     } else {
-        fs::read_to_string(path).map_err(GudfError::Io)
+        // Not a file path — treat as raw text
+        Ok(input.to_string())
     }
 }
 
@@ -231,7 +235,7 @@ fn main() {
     }
 
     if cli.annotate {
-        engine.add_annotator(Box::new(SensitiveFieldAnnotator));
+        engine.add_annotator(Box::new(SensitiveFieldAnnotator::default()));
     }
 
     let result = if cross_format_mode {
@@ -278,6 +282,7 @@ fn main() {
             UnifiedFormatter::new(&file1, &file2).context(cli.context),
         ),
         "inline" => Box::new(InlineFormatter),
+        "json" => Box::new(JsonFormatter),
         "json-patch" => Box::new(JsonPatchFormatter),
         other => {
             eprintln!(
@@ -478,6 +483,9 @@ fn run_chain_diff(chain: &MutationChain, range: &str, output_format: &str, conte
         "inline" => chain
             .unified(from, to)
             .render_with(&InlineFormatter),
+        "json" => chain
+            .unified(from, to)
+            .render_with(&JsonFormatter),
         "json-patch" => chain
             .unified(from, to)
             .render_with(&JsonPatchFormatter),

@@ -59,7 +59,7 @@ impl Annotator for AstNodeAnnotator {
 
         let mut annotations = Vec::new();
         for node_type in &node_types {
-            if path == *node_type || path.contains(node_type) {
+            if path == *node_type {
                 annotations.push(Annotation {
                     key: "ast_node".to_string(),
                     value: AnnotationValue::Tag(node_type.to_string()),
@@ -73,9 +73,11 @@ impl Annotator for AstNodeAnnotator {
 }
 
 /// Flags changes to fields whose names suggest sensitive data.
-pub struct SensitiveFieldAnnotator;
+pub struct SensitiveFieldAnnotator {
+    patterns: Vec<String>,
+}
 
-const SENSITIVE_PATTERNS: &[&str] = &[
+const DEFAULT_SENSITIVE_PATTERNS: &[&str] = &[
     "password",
     "passwd",
     "secret",
@@ -88,7 +90,29 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "credential",
     "auth",
     "authorization",
+    "session",
+    "cookie",
+    "jwt",
+    "bearer",
+    "client_secret",
 ];
+
+impl SensitiveFieldAnnotator {
+    pub fn new(patterns: Vec<String>) -> Self {
+        Self { patterns }
+    }
+}
+
+impl Default for SensitiveFieldAnnotator {
+    fn default() -> Self {
+        Self {
+            patterns: DEFAULT_SENSITIVE_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
 
 impl Annotator for SensitiveFieldAnnotator {
     fn annotate(&self, change: &Change) -> Vec<Annotation> {
@@ -97,8 +121,8 @@ impl Annotator for SensitiveFieldAnnotator {
         };
 
         let lower = path.to_lowercase();
-        for pattern in SENSITIVE_PATTERNS {
-            if lower.contains(pattern) {
+        for pattern in &self.patterns {
+            if lower.contains(pattern.as_str()) {
                 return vec![
                     Annotation {
                         key: "sensitive".to_string(),
@@ -177,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_sensitive_field_annotator() {
-        let annotator = SensitiveFieldAnnotator;
+        let annotator = SensitiveFieldAnnotator::default();
         let change = make_change(ChangeKind::Modified, Some("database.password"), Some("old"), Some("new"));
         let annotations = annotator.annotate(&change);
         assert!(!annotations.is_empty());
@@ -186,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_sensitive_field_no_match() {
-        let annotator = SensitiveFieldAnnotator;
+        let annotator = SensitiveFieldAnnotator::default();
         let change = make_change(ChangeKind::Modified, Some("database.host"), Some("old"), Some("new"));
         let annotations = annotator.annotate(&change);
         assert!(annotations.is_empty());
@@ -217,7 +241,7 @@ mod tests {
             make_change(ChangeKind::Modified, Some("config.host"), Some("old"), Some("new")),
         ];
         let annotators: Vec<Box<dyn Annotator>> = vec![
-            Box::new(SensitiveFieldAnnotator),
+            Box::new(SensitiveFieldAnnotator::default()),
             Box::new(PathDepthAnnotator),
         ];
         annotate_changes(&mut changes, &annotators);
@@ -225,5 +249,40 @@ mod tests {
         assert!(changes[0].annotations.iter().any(|a| a.key == "sensitive"));
         assert!(!changes[1].annotations.is_empty());
         assert!(changes[1].annotations.iter().all(|a| a.key != "sensitive"));
+    }
+
+    #[test]
+    fn test_sensitive_new_patterns() {
+        let annotator = SensitiveFieldAnnotator::default();
+        for field in &["session_id", "cookie_value", "jwt_token", "bearer_auth", "client_secret"] {
+            let change = make_change(ChangeKind::Modified, Some(field), Some("old"), Some("new"));
+            let annotations = annotator.annotate(&change);
+            assert!(
+                annotations.iter().any(|a| a.key == "sensitive"),
+                "Expected {field} to be flagged as sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sensitive_custom_patterns() {
+        let annotator = SensitiveFieldAnnotator::new(vec!["custom_field".to_string()]);
+        let change = make_change(ChangeKind::Modified, Some("my_custom_field"), Some("old"), Some("new"));
+        let annotations = annotator.annotate(&change);
+        assert!(annotations.iter().any(|a| a.key == "sensitive"));
+
+        // Default patterns should NOT match with custom-only
+        let change2 = make_change(ChangeKind::Modified, Some("password"), Some("old"), Some("new"));
+        let annotations2 = annotator.annotate(&change2);
+        assert!(annotations2.is_empty());
+    }
+
+    #[test]
+    fn test_ast_node_no_substring_match() {
+        let annotator = AstNodeAnnotator;
+        // "my_function_definition_v2" should NOT match "function_definition"
+        let change = make_change(ChangeKind::Modified, Some("my_function_definition_v2"), Some("old"), Some("new"));
+        let annotations = annotator.annotate(&change);
+        assert!(annotations.is_empty(), "Should not match by substring");
     }
 }

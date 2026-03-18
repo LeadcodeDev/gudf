@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::result::{Change, ChangeKind, DiffResult, DiffStats};
 
 /// Configuration for semantic analysis.
@@ -67,6 +69,7 @@ impl SemanticAnalyzer {
 
         let mut matched_removed: Vec<bool> = vec![false; removed_indices.len()];
         let mut matched_added: Vec<bool> = vec![false; added_indices.len()];
+        let mut to_remove: HashSet<usize> = HashSet::new();
 
         // For each removed+added pair, check for exact value match
         for (ri, &removed_idx) in removed_indices.iter().enumerate() {
@@ -95,49 +98,53 @@ impl SemanticAnalyzer {
                     continue;
                 }
 
-                // Same value found. Determine if it's a Move or Rename.
-                if self.options.move_detection && removed_path == added_path {
-                    // Same path, same value — this shouldn't normally happen
-                    // (it would be Unchanged), but handle gracefully
+                // Same value found at different paths. Determine if it's a Move or Rename.
+                if removed_path == added_path {
+                    // Same path, same value — this is Unchanged, skip
                     continue;
                 }
 
-                if self.options.rename_detection && removed_path != added_path {
-                    // Different path, same value = Rename (key changed)
-                    // Check if they share a parent path (sibling rename)
-                    let is_sibling = Self::are_siblings(removed_path, added_path);
+                let is_sibling = Self::are_siblings(removed_path, added_path);
 
-                    let kind = if is_sibling {
-                        ChangeKind::Renamed
-                    } else {
-                        ChangeKind::Moved
-                    };
-
-                    matched_removed[ri] = true;
-                    matched_added[ai] = true;
-
-                    // Update the removed entry to be a Move/Rename
-                    changes[removed_idx] = Change {
-                        kind,
-                        path: Some(removed_path.to_string()),
-                        old_value: Some(removed_value.to_string()),
-                        new_value: Some(added_path.to_string()),
-                        location: changes[removed_idx].location.clone(),
-                        annotations: changes[removed_idx].annotations.clone(),
-                    };
-
-                    // Mark the added entry as Unchanged (will be filtered)
-                    changes[added_idx].kind = ChangeKind::Unchanged;
-                    break;
+                // Check flags: siblings → rename_detection, non-siblings → move_detection
+                if is_sibling && !self.options.rename_detection {
+                    continue;
                 }
+                if !is_sibling && !self.options.move_detection {
+                    continue;
+                }
+
+                let kind = if is_sibling {
+                    ChangeKind::Renamed
+                } else {
+                    ChangeKind::Moved
+                };
+
+                matched_removed[ri] = true;
+                matched_added[ai] = true;
+
+                // Update the removed entry to be a Move/Rename
+                changes[removed_idx] = Change {
+                    kind,
+                    path: Some(removed_path.to_string()),
+                    old_value: Some(removed_value.to_string()),
+                    new_value: Some(added_path.to_string()),
+                    location: changes[removed_idx].location.clone(),
+                    annotations: changes[removed_idx].annotations.clone(),
+                };
+
+                // Mark the added entry for removal
+                to_remove.insert(added_idx);
+                break;
             }
         }
 
-        // Remove the now-Unchanged entries that were part of move/rename pairs
-        changes.retain(|c| {
-            !(c.kind == ChangeKind::Unchanged
-                && c.old_value.is_none()
-                && c.new_value.is_some())
+        // Remove the paired added entries by index
+        let mut idx = 0;
+        changes.retain(|_| {
+            let keep = !to_remove.contains(&idx);
+            idx += 1;
+            keep
         });
     }
 
@@ -289,5 +296,115 @@ mod tests {
 
         assert_eq!(result.stats.renames, 0);
         assert_eq!(result.stats.moves, 0);
+    }
+
+    #[test]
+    fn test_move_off_rename_on() {
+        // Siblings should be detected as Renamed, non-siblings should be ignored
+        let changes = vec![
+            // Sibling pair (same parent "user")
+            Change {
+                kind: ChangeKind::Removed,
+                path: Some("user.firstName".to_string()),
+                old_value: Some("\"Alice\"".to_string()),
+                new_value: None,
+                location: None,
+                annotations: Vec::new(),
+            },
+            Change {
+                kind: ChangeKind::Added,
+                path: Some("user.first_name".to_string()),
+                old_value: None,
+                new_value: Some("\"Alice\"".to_string()),
+                location: None,
+                annotations: Vec::new(),
+            },
+            // Non-sibling pair (different parents)
+            Change {
+                kind: ChangeKind::Removed,
+                path: Some("old_section.key".to_string()),
+                old_value: Some("\"val\"".to_string()),
+                new_value: None,
+                location: None,
+                annotations: Vec::new(),
+            },
+            Change {
+                kind: ChangeKind::Added,
+                path: Some("new_section.key".to_string()),
+                old_value: None,
+                new_value: Some("\"val\"".to_string()),
+                location: None,
+                annotations: Vec::new(),
+            },
+        ];
+
+        let options = SemanticOptions {
+            move_detection: false,
+            rename_detection: true,
+            rename_threshold: 1.0,
+        };
+        let analyzer = SemanticAnalyzer::new(options);
+        let result = analyzer.analyze(make_result(changes));
+
+        assert_eq!(result.stats.renames, 1);
+        assert_eq!(result.stats.moves, 0);
+        // The non-sibling pair should remain as Added+Removed
+        assert_eq!(result.stats.additions, 1);
+        assert_eq!(result.stats.deletions, 1);
+    }
+
+    #[test]
+    fn test_move_on_rename_off() {
+        // Non-siblings should be detected as Moved, siblings should be ignored
+        let changes = vec![
+            // Sibling pair
+            Change {
+                kind: ChangeKind::Removed,
+                path: Some("user.firstName".to_string()),
+                old_value: Some("\"Alice\"".to_string()),
+                new_value: None,
+                location: None,
+                annotations: Vec::new(),
+            },
+            Change {
+                kind: ChangeKind::Added,
+                path: Some("user.first_name".to_string()),
+                old_value: None,
+                new_value: Some("\"Alice\"".to_string()),
+                location: None,
+                annotations: Vec::new(),
+            },
+            // Non-sibling pair
+            Change {
+                kind: ChangeKind::Removed,
+                path: Some("old_section.key".to_string()),
+                old_value: Some("\"val\"".to_string()),
+                new_value: None,
+                location: None,
+                annotations: Vec::new(),
+            },
+            Change {
+                kind: ChangeKind::Added,
+                path: Some("new_section.key".to_string()),
+                old_value: None,
+                new_value: Some("\"val\"".to_string()),
+                location: None,
+                annotations: Vec::new(),
+            },
+        ];
+
+        let options = SemanticOptions {
+            move_detection: true,
+            rename_detection: false,
+            rename_threshold: 1.0,
+        };
+        let analyzer = SemanticAnalyzer::new(options);
+        let result = analyzer.analyze(make_result(changes));
+
+        assert_eq!(result.stats.moves, 1);
+        assert_eq!(result.stats.renames, 0);
+        // The sibling pair should remain as Added+Removed
+        assert_eq!(result.stats.additions, 1);
+        assert_eq!(result.stats.deletions, 1);
     }
 }

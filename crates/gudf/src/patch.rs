@@ -1,5 +1,6 @@
 use crate::error::GudfError;
 use crate::format::{detect_format, FormatKind};
+use crate::path::{self, PathSegment};
 use crate::result::{Change, ChangeKind};
 
 pub trait Patchable {
@@ -141,22 +142,22 @@ fn patch_yaml(original: &str, changes: &[Change]) -> Result<String, GudfError> {
 
 fn set_json_path(
     root: &mut serde_json::Value,
-    path: &str,
+    path_str: &str,
     new_value: serde_json::Value,
 ) -> Result<(), GudfError> {
-    let parts = parse_path(path);
+    let parts = path::parse_path(path_str);
     let mut current = root;
 
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             match part {
-                PathPart::Key(key) => {
+                PathSegment::Key(key) => {
                     if let serde_json::Value::Object(map) = current {
                         map.insert(key.clone(), new_value);
                         return Ok(());
                     }
                 }
-                PathPart::Index(idx) => {
+                PathSegment::Index(idx) => {
                     if let serde_json::Value::Array(arr) = current {
                         if *idx < arr.len() {
                             arr[*idx] = new_value;
@@ -166,37 +167,39 @@ fn set_json_path(
                 }
             }
             return Err(GudfError::PatchError(format!(
-                "Cannot set value at path: {path}"
+                "Cannot set value at path: {path_str}"
             )));
         }
 
         current = match part {
-            PathPart::Key(key) => current
+            PathSegment::Key(key) => current
                 .get_mut(key.as_str())
-                .ok_or_else(|| GudfError::PatchError(format!("Path not found: {path}")))?,
-            PathPart::Index(idx) => current
+                .ok_or_else(|| GudfError::PatchError(format!("Path not found: {path_str}")))?,
+            PathSegment::Index(idx) => current
                 .get_mut(*idx)
-                .ok_or_else(|| GudfError::PatchError(format!("Index out of bounds: {path}")))?,
+                .ok_or_else(|| {
+                    GudfError::PatchError(format!("Index out of bounds: {path_str}"))
+                })?,
         };
     }
 
     Ok(())
 }
 
-fn remove_json_path(root: &mut serde_json::Value, path: &str) -> Result<(), GudfError> {
-    let parts = parse_path(path);
+fn remove_json_path(root: &mut serde_json::Value, path_str: &str) -> Result<(), GudfError> {
+    let parts = path::parse_path(path_str);
     let mut current = root;
 
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             match part {
-                PathPart::Key(key) => {
+                PathSegment::Key(key) => {
                     if let serde_json::Value::Object(map) = current {
                         map.remove(key.as_str());
                         return Ok(());
                     }
                 }
-                PathPart::Index(idx) => {
+                PathSegment::Index(idx) => {
                     if let serde_json::Value::Array(arr) = current {
                         if *idx < arr.len() {
                             arr.remove(*idx);
@@ -206,59 +209,23 @@ fn remove_json_path(root: &mut serde_json::Value, path: &str) -> Result<(), Gudf
                 }
             }
             return Err(GudfError::PatchError(format!(
-                "Cannot remove at path: {path}"
+                "Cannot remove at path: {path_str}"
             )));
         }
 
         current = match part {
-            PathPart::Key(key) => current
+            PathSegment::Key(key) => current
                 .get_mut(key.as_str())
-                .ok_or_else(|| GudfError::PatchError(format!("Path not found: {path}")))?,
-            PathPart::Index(idx) => current
+                .ok_or_else(|| GudfError::PatchError(format!("Path not found: {path_str}")))?,
+            PathSegment::Index(idx) => current
                 .get_mut(*idx)
-                .ok_or_else(|| GudfError::PatchError(format!("Index out of bounds: {path}")))?,
+                .ok_or_else(|| {
+                    GudfError::PatchError(format!("Index out of bounds: {path_str}"))
+                })?,
         };
     }
 
     Ok(())
-}
-
-enum PathPart {
-    Key(String),
-    Index(usize),
-}
-
-fn parse_path(path: &str) -> Vec<PathPart> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for ch in path.chars() {
-        match ch {
-            '.' => {
-                if !current.is_empty() {
-                    parts.push(PathPart::Key(current.clone()));
-                    current.clear();
-                }
-            }
-            '[' => {
-                if !current.is_empty() {
-                    parts.push(PathPart::Key(current.clone()));
-                    current.clear();
-                }
-            }
-            ']' => {
-                if let Ok(idx) = current.parse::<usize>() {
-                    parts.push(PathPart::Index(idx));
-                }
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        parts.push(PathPart::Key(current));
-    }
-    parts
 }
 
 #[cfg(test)]
@@ -319,6 +286,32 @@ mod tests {
     fn test_roundtrip_json() {
         let old = r#"{"a": 1, "b": 2}"#;
         let new = r#"{"a": 1, "b": 3, "c": 4}"#;
+
+        let engine = crate::engine::DiffEngine::new();
+        let diff_result = engine.diff_as(FormatKind::Json, old, new).unwrap();
+        let patched = patch_json(old, &diff_result.changes).unwrap();
+        let patched_val: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        let expected_val: serde_json::Value = serde_json::from_str(new).unwrap();
+        assert_eq!(patched_val, expected_val);
+    }
+
+    #[test]
+    fn test_roundtrip_json_dotted_keys() {
+        let old = r#"{"my.dotted.key": 1, "normal": 2}"#;
+        let new = r#"{"my.dotted.key": 42, "normal": 2}"#;
+
+        let engine = crate::engine::DiffEngine::new();
+        let diff_result = engine.diff_as(FormatKind::Json, old, new).unwrap();
+        let patched = patch_json(old, &diff_result.changes).unwrap();
+        let patched_val: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        let expected_val: serde_json::Value = serde_json::from_str(new).unwrap();
+        assert_eq!(patched_val, expected_val);
+    }
+
+    #[test]
+    fn test_roundtrip_json_arrays() {
+        let old = r#"{"items": [{"name": "a"}, {"name": "b"}]}"#;
+        let new = r#"{"items": [{"name": "a"}, {"name": "c"}]}"#;
 
         let engine = crate::engine::DiffEngine::new();
         let diff_result = engine.diff_as(FormatKind::Json, old, new).unwrap();
